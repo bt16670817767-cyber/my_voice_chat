@@ -1,0 +1,100 @@
+# Prerequisites
+*.d
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Fortran module files
+*.mod
+*.smod
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+VoiceChatServer/cmake-build-debug
+VoiceChatServer/cmake-build-vcpkg
+VoiceChatClient/cmake-build-debug
+VoiceChatClient/cmake-build-vcpkg
+VoiceChatClient/out/
+VoiceChatClient/.vs/
+VoiceChatClient/CMakeSettings.json
+VoiceChatServer/.vs/
+VoiceChatServer/out/
+VoiceChatServer/CMakeSettings.json
+VoiceChatServer/vcpkg_installed
+VoiceChatServer/CMakeFiles
+VoiceChatServer/build
+vcpkg-manifest-install.log
+ReRunCMake.make
+CMakeCache.txt
+cmake_install.cmake
+VoiceChatClient/build
+VoiceChatClient/CMakeFiles
+VoiceChatClient/Debug
+VoiceChatClient/vcpkg_installed
+VoiceChatClient/VoiceChatClient.xcodeproj/project.xcworkspace
+VoiceChatServer/VoiceChatServer.xcodeproj/project.xcworkspace
+VoiceChatServer/VoiceChatServer.xcodeproj/xcuserdata
+# Mac OS X
+*.DS_Store
+
+# Xcode
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+*.xcuserstate
+project.xcworkspace/
+xcuserdata/
+
+# Generated files
+*.o
+*.pyc
+
+
+#Python modules
+MANIFEST
+dist/
+build/
+
+# Backup files
+*~.nib
+VoiceChatServer/Debug
+*.pbxproj
+VoiceChatServer/enc_temp_folder/
+
+# ---------------- 补充项 ----------------
+
+# VS Code 本地工作区设置 (通常包含个人的绝对路径，极易引起协作者环境冲突)
+.vscode/
+*.code-workspace
+
+# C++ 语言服务器生成的编译数据库 (VS Code IntelliSense 常用)
+compile_commands.json
+
+# 根目录级别的通用构建文件夹 (防止在项目顶层手滑执行 cmake 产生的垃圾)
+/build/
+/out/
+
+# Windows 系统缓存文件
+Thumbs.db
+Desktop.ini
