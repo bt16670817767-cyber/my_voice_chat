@@ -23,7 +23,7 @@ ENV PATH="${VCPKG_ROOT}:${PATH}"
 
 # Install dependencies
 ENV VCPKG_MAX_CONCURRENCY=2
-RUN vcpkg install gamenetworkingsockets:x64-linux
+RUN vcpkg install gamenetworkingsockets:x64-linux ftxui:x64-linux
 
 # Copy source code
 COPY . .

@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 project(VoiceChatServer)
 
 find_package( GameNetworkingSockets CONFIG REQUIRED)
+find_package(ftxui CONFIG REQUIRED)
 
 set(CMAKE_CXX_STANDARD 17)
 
@@ -11,4 +12,9 @@ add_executable(VoiceChatServer main.cpp
         Server.h
          "../Common/Messages/AudioMessage.h" "../Common/Messages/MessageTypes.h" "../Common/Messages/SetChannelMessage.h")
 
-target_link_libraries(VoiceChatServer GameNetworkingSockets::shared)
+target_link_libraries(VoiceChatServer
+        PRIVATE
+        GameNetworkingSockets::shared
+        ftxui::screen
+        ftxui::dom
+        ftxui::component)
