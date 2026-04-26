@@ -40,6 +40,7 @@ WORKDIR /app
 
 # Copy the built binary and required libraries
 COPY --from=build /app/VoiceChatServer/build/VoiceChatServer /app/
+COPY --from=build /app/VoiceChatServer/users.db /app/
 COPY --from=build /opt/vcpkg/installed/x64-linux/lib/libGameNetworkingSockets.so /usr/lib/
 
 # Install runtime dependencies

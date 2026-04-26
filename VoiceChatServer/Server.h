@@ -43,12 +43,23 @@
 #include "../Common/Messages/MessageTypes.h"
 #include "../Common/Messages/AudioMessage.h"
 #include "../Common/Messages/SetChannelMessage.h"
+#include "../Common/Messages/LoginRequestMessage.h"
+#include "../Common/Messages/LoginResponseMessage.h"
+#include "../Common/Messages/ServerErrorMessage.h"
 #include <map>
 #include <set>
+#include <mutex>
 
 
 class Server {
 private:
+    struct SessionInfo {
+        bool authenticated = false;
+        int32_t userId = -1;
+        std::string username;
+        std::string displayName;
+    };
+
     HSteamListenSocket socket;
     uint16 sentBytesCount;
     uint16 receivedBytesCount;
@@ -56,10 +67,17 @@ private:
     static SteamNetworkingMicroseconds g_logTimeZero;
     static HSteamNetPollGroup connectionPollGroup;
     static std::map<int64, std::set<HSteamNetConnection>> channelToConnnectionsMap;
+    static std::map<HSteamNetConnection, SessionInfo> connectionSessions;
+    static std::mutex sessionMutex;
+    static std::mutex channelMutex;
 
     static void InitSteamDatagramConnectionSockets();
     static void DebugOutput( ESteamNetworkingSocketsDebugOutputType eType, const char *pszMsg );
     static void OnSteamNetConnectionStatusChanged( SteamNetConnectionStatusChangedCallback_t *pInfo );
+    static void RemoveConnectionFromChannel(HSteamNetConnection connection, int64 channel);
+    static bool IsAuthenticated(HSteamNetConnection connection);
+    static void SendServerError(HSteamNetConnection connection, int32_t errorCode, const char* message);
+    static void HandleLoginRequest(HSteamNetConnection connection, const LoginRequest* request, uint32 messageSize);
 
 public:
     static Server* Instance;

@@ -10,7 +10,12 @@ set(CMAKE_CXX_STANDARD 17)
 add_executable(VoiceChatServer main.cpp
         Server.cpp
         Server.h
-         "../Common/Messages/AudioMessage.h" "../Common/Messages/MessageTypes.h" "../Common/Messages/SetChannelMessage.h")
+        Auth/UserRepository.cpp
+        Auth/UserRepository.h
+        Auth/PasswordHasher.cpp
+        Auth/PasswordHasher.h
+         "../Common/Messages/AudioMessage.h" "../Common/Messages/MessageTypes.h" "../Common/Messages/SetChannelMessage.h"
+         "../Common/Messages/LoginRequestMessage.h" "../Common/Messages/LoginResponseMessage.h" "../Common/Messages/ServerErrorMessage.h")
 
 target_link_libraries(VoiceChatServer
         PRIVATE

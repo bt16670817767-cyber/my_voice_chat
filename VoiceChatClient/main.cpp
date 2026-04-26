@@ -25,6 +25,8 @@ int main(int argc, const char* argv[]) {
     char server_ip[64] = "127.0.0.1";
     int port = 27020;
     int channel = 0;
+    char username[32] = "demo";
+    char password[64] = "123456";
 
     if (argc == 4) {
         std::snprintf(server_ip, sizeof(server_ip), "%s", argv[1]);
@@ -57,14 +59,17 @@ int main(int argc, const char* argv[]) {
 
     std::atomic<bool> running{true};
     std::atomic<bool> connected{false};
+    std::atomic<bool> connecting{false};
     std::atomic<bool> recording_started{false};
     std::string status_text = "Idle";
+    std::string auth_status_text = "Not logged in.";
 
     std::thread network_loop([&] {
         while (running.load()) {
             client_socket->PollIncomingMessages(&network_buffer);
             client_socket->PollConnectionStateChanges();
             connected.store(client_socket->IsConnected());
+            connecting.store(client_socket->IsConnecting());
             std::this_thread::sleep_for(std::chrono::milliseconds(30));
         }
     });
@@ -81,40 +86,71 @@ int main(int argc, const char* argv[]) {
         ImGui::InputInt("Port", &port);
         ImGui::InputInt("Channel", &channel);
 
-        if (!connected.load()) {
+        const std::string socket_status = client_socket->GetStatusMessage();
+        if (socket_status != status_text) {
+            status_text = socket_status;
+        }
+        auth_status_text = client_socket->GetAuthMessage();
+        const bool authenticated = client_socket->IsAuthenticated();
+
+        if (!connected.load() && !connecting.load()) {
             if (ImGui::Button("Connect")) {
-                SteamNetworkingIPAddr server_address;
-                if (!ParseAddress(server_ip, static_cast<uint16>(port), &server_address)) {
-                    status_text = "Invalid server IP.";
-                } else if (!client_socket->Connect(server_address)) {
-                    status_text = "Failed to create connection.";
+                if (port <= 0 || port > 65535) {
+                    status_text = "Port must be between 1 and 65535.";
                 } else {
-                    status_text = "Connecting...";
+                SteamNetworkingIPAddr server_address;
+                    if (!ParseAddress(server_ip, static_cast<uint16>(port), &server_address)) {
+                        status_text = "Invalid server IP.";
+                    } else if (!client_socket->Connect(server_address)) {
+                        status_text = "Failed to create connection.";
+                    } else {
+                        status_text = "Connecting...";
+                    }
                 }
             }
+        } else if (connecting.load() && !connected.load()) {
+            ImGui::TextUnformatted("Connecting...");
         } else {
             ImGui::TextUnformatted("Connected");
-            if (!recording_started.load() && ImGui::Button("Start Audio")) {
-                SetChannel message;
-                message.channel = channel;
-                client_socket->Send(&message, sizeof(message));
-                if (audio_tools->StartRecording(client_socket, &network_buffer)) {
-                    recording_started.store(true);
-                    status_text = "Audio streaming started.";
-                } else {
-                    status_text = "Failed to start audio stream.";
+            ImGui::InputText("Username", username, sizeof(username));
+            ImGui::InputText("Password", password, sizeof(password), ImGuiInputTextFlags_Password);
+            if (!authenticated) {
+                if (ImGui::Button("Login")) {
+                    client_socket->SendLoginRequest(username, password);
                 }
+                ImGui::TextUnformatted("Please login before selecting channel or audio.");
+            } else {
+                ImGui::Text("Logged in as: %s (#%d)", client_socket->GetDisplayName().c_str(), client_socket->GetUserId());
+            }
+
+            ImGui::BeginDisabled(!authenticated);
+            if (!recording_started.load() && ImGui::Button("Start Audio")) {
+                    SetChannel message;
+                    message.channel = channel;
+                    client_socket->Send(&message, sizeof(message));
+                    if (audio_tools->StartRecording(client_socket, &network_buffer)) {
+                        recording_started.store(true);
+                        status_text = "Audio streaming started.";
+                    } else {
+                        status_text = "Failed to start audio stream.";
+                    }
             }
             if (recording_started.load() && ImGui::Button("Stop Audio")) {
                 audio_tools->StopRecording();
                 recording_started.store(false);
                 status_text = "Audio streaming stopped.";
             }
+            ImGui::EndDisabled();
         }
 
         ImGui::Separator();
-        ImGui::Text("Connection: %s", connected.load() ? "Connected" : "Disconnected");
+        const char* connection_text = connected.load()
+                                          ? "Connected"
+                                          : (connecting.load() ? "Connecting" : "Disconnected");
+        ImGui::Text("Connection: %s", connection_text);
+        ImGui::Text("Auth: %s", authenticated ? "Authenticated" : "Unauthenticated");
         ImGui::Text("Audio: %s", recording_started.load() ? "Running" : "Stopped");
+        ImGui::TextWrapped("Login: %s", auth_status_text.c_str());
         ImGui::TextWrapped("Status: %s", status_text.c_str());
         ImGui::End();
 

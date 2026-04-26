@@ -3,11 +3,20 @@
 //
 
 #include "SocketClient.h"
+#include <cstdio>
 
 SteamNetworkingMicroseconds SocketClient::g_logTimeZero;
 HSteamNetConnection SocketClient::connection;
 ISteamNetworkingSockets* SocketClient::steamNetworking;
-bool SocketClient::isConnected = false;
+std::atomic<bool> SocketClient::isConnected{false};
+std::atomic<bool> SocketClient::isConnecting{false};
+std::atomic<bool> SocketClient::isAuthenticated{false};
+std::string SocketClient::statusMessage = "Idle";
+std::string SocketClient::authMessage = "Not logged in.";
+std::string SocketClient::displayName;
+int32_t SocketClient::userId = -1;
+std::mutex SocketClient::statusMessageMutex;
+std::mutex SocketClient::authMutex;
 
 
 void SocketClient::InitSteamDatagramConnectionSockets() {
@@ -87,17 +96,36 @@ void SocketClient::OnSteamNetConnectionStatusChanged(SteamNetConnectionStatusCha
             printf("closing connection\n");
             steamNetworking->CloseConnection( pInfo->m_hConn, 0, nullptr, false );
             connection = k_HSteamNetConnection_Invalid;
+            isConnected.store(false);
+            isConnecting.store(false);
+            isAuthenticated.store(false);
+            {
+                std::lock_guard<std::mutex> lock(authMutex);
+                userId = -1;
+                displayName.clear();
+                authMessage = "Not logged in.";
+            }
+            if (pInfo->m_eOldState == k_ESteamNetworkingConnectionState_Connecting) {
+                SetStatusMessage(std::string("Connect failed: ") + pInfo->m_info.m_szEndDebug);
+            } else {
+                SetStatusMessage(std::string("Disconnected: ") + pInfo->m_info.m_szEndDebug);
+            }
             break;
         }
 
         case k_ESteamNetworkingConnectionState_Connecting:
             // We will get this callback when we start connecting.
             // We can ignore this.
+            isConnecting.store(true);
             break;
 
         case k_ESteamNetworkingConnectionState_Connected:
             printf( "Connected to server OK" );
-            isConnected = true;
+            isConnected.store(true);
+            isConnecting.store(false);
+            isAuthenticated.store(false);
+            SetAuthMessage("Connected. Please login.");
+            SetStatusMessage("Connected to server.");
             break;
 
         default:
@@ -111,6 +139,9 @@ void SocketClient::OnSteamNetConnectionStatusChanged(SteamNetConnectionStatusCha
 bool SocketClient::Connect(SteamNetworkingIPAddr add) {
 
     printf("trying to connect to server....");
+    isConnected.store(false);
+    isConnecting.store(true);
+    SetStatusMessage("Connecting...");
 
 
     SteamNetworkingConfigValue_t options;
@@ -121,6 +152,8 @@ bool SocketClient::Connect(SteamNetworkingIPAddr add) {
     if ( connection == k_HSteamNetConnection_Invalid )
     {
         printf( "Failed to create connection" );
+        isConnecting.store(false);
+        SetStatusMessage("Failed to create connection.");
         return false;
     }
 
@@ -148,22 +181,56 @@ void SocketClient::PollIncomingMessages(NetworkBuffer* _voiceAudioBuffer)
         }
 
 
-        auto* audioData = static_cast<AudioData*>(pIncomingMsg->m_pData);
-        if (!audioData) {
-            // Handle the case where the cast failed
+        if (pIncomingMsg->m_pData == nullptr || pIncomingMsg->GetSize() == 0) {
             pIncomingMsg->Release();
             continue;
         }
+
+        const uint8_t messageType = static_cast<uint8_t*>(pIncomingMsg->m_pData)[0];
+        if (messageType == LOGIN_RES) {
+            if (pIncomingMsg->GetSize() < sizeof(LoginResponse)) {
+                SetAuthMessage("Server returned malformed login response.");
+                pIncomingMsg->Release();
+                continue;
+            }
+            auto* loginResponse = static_cast<LoginResponse*>(pIncomingMsg->m_pData);
+            if (loginResponse->success == 1) {
+                isAuthenticated.store(true);
+                {
+                    std::lock_guard<std::mutex> lock(authMutex);
+                    userId = loginResponse->userId;
+                    displayName = loginResponse->displayName;
+                }
+                SetAuthMessage(loginResponse->message[0] != '\0' ? loginResponse->message : "Login success.");
+            } else {
+                isAuthenticated.store(false);
+                {
+                    std::lock_guard<std::mutex> lock(authMutex);
+                    userId = -1;
+                    displayName.clear();
+                }
+                SetAuthMessage(loginResponse->message[0] != '\0' ? loginResponse->message : "Login failed.");
+            }
+            pIncomingMsg->Release();
+            continue;
+        }
+
+        if (messageType == SERVER_ERROR) {
+            if (pIncomingMsg->GetSize() >= sizeof(ServerErrorMessage)) {
+                auto* serverError = static_cast<ServerErrorMessage*>(pIncomingMsg->m_pData);
+                SetStatusMessage(std::string("Server error: ") + serverError->message);
+            } else {
+                SetStatusMessage("Server returned malformed error message.");
+            }
+            pIncomingMsg->Release();
+            continue;
+        }
+
+        auto* audioData = static_cast<AudioData*>(pIncomingMsg->m_pData);
 
         printf("received data from server, size: %u \n", audioData->inputCurrentCounter);
 
         printf("receive counter is %d \n", ++receiveCounter);
-        if (pIncomingMsg->GetSize() == 0) {
-            pIncomingMsg->Release();
-            continue;
-        }
-        //_voiceAudioBuffer->ResetData();
-
         // Playback
         const size_t buffer_size = audioData->inputCurrentCounter;
         for (size_t i = 0; i < buffer_size; ++i) {
@@ -196,12 +263,61 @@ SocketClient::~SocketClient() {
 
 
 void SocketClient::Send(const void *data, uint32 size) {
-
+    if (connection == k_HSteamNetConnection_Invalid) {
+        SetStatusMessage("Cannot send: no active connection.");
+        return;
+    }
     steamNetworking->SendMessageToConnection(connection, data,size,
                                              k_nSteamNetworkingSend_ReliableNoNagle,
                                              nullptr);
 }
 
+void SocketClient::SendLoginRequest(const char* username, const char* password) {
+    LoginRequest request;
+    std::snprintf(request.username, sizeof(request.username), "%s", username == nullptr ? "" : username);
+    std::snprintf(request.password, sizeof(request.password), "%s", password == nullptr ? "" : password);
+    Send(&request, sizeof(request));
+    SetAuthMessage("Login request sent.");
+}
+
 bool SocketClient::IsConnected() {
-    return isConnected;
+    return isConnected.load();
+}
+
+bool SocketClient::IsConnecting() {
+    return isConnecting.load();
+}
+
+bool SocketClient::IsAuthenticated() {
+    return isAuthenticated.load();
+}
+
+void SocketClient::SetStatusMessage(const std::string& message) {
+    std::lock_guard<std::mutex> lock(statusMessageMutex);
+    statusMessage = message;
+}
+
+std::string SocketClient::GetStatusMessage() {
+    std::lock_guard<std::mutex> lock(statusMessageMutex);
+    return statusMessage;
+}
+
+void SocketClient::SetAuthMessage(const std::string& message) {
+    std::lock_guard<std::mutex> lock(authMutex);
+    authMessage = message;
+}
+
+std::string SocketClient::GetAuthMessage() {
+    std::lock_guard<std::mutex> lock(authMutex);
+    return authMessage;
+}
+
+std::string SocketClient::GetDisplayName() {
+    std::lock_guard<std::mutex> lock(authMutex);
+    return displayName;
+}
+
+int32_t SocketClient::GetUserId() {
+    std::lock_guard<std::mutex> lock(authMutex);
+    return userId;
 }

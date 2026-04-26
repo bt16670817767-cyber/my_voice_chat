@@ -2,12 +2,22 @@
 // Created by Amin on 10/15/23.
 //
 #include "Server.h"
+#include "Auth/UserRepository.h"
+#include "Auth/PasswordHasher.h"
+#include <cstring>
+
+namespace {
+UserRepository g_userRepository("users.db");
+}
 
 Server* Server::Instance = nullptr;
 SteamNetworkingMicroseconds Server::g_logTimeZero;
 ISteamNetworkingSockets* Server::steamNetworking;
 HSteamNetPollGroup Server::connectionPollGroup;
 std::map<int64, std::set<HSteamNetConnection>> Server::channelToConnnectionsMap;
+std::map<HSteamNetConnection, Server::SessionInfo> Server::connectionSessions;
+std::mutex Server::sessionMutex;
+std::mutex Server::channelMutex;
 
 
 bool Server::StartServer(uint16 port) {
@@ -17,6 +27,10 @@ bool Server::StartServer(uint16 port) {
     InitSteamDatagramConnectionSockets();
 
     steamNetworking = SteamNetworkingSockets();
+    if (!g_userRepository.EnsureDefaultData()) {
+        printf("Failed to initialize users database file.\n");
+        return false;
+    }
 
     connectionPollGroup = steamNetworking->CreatePollGroup();
 
@@ -54,12 +68,8 @@ Server::~Server() {
 
 void Server::DebugOutput( ESteamNetworkingSocketsDebugOutputType eType, const char *pszMsg )
 {
-    SteamNetworkingMicroseconds time = SteamNetworkingUtils()->GetLocalTimestamp() - g_logTimeZero;
-    printf( "%10.6f %s\n", time*1e-6, pszMsg );
-    fflush(stdout);
-    if ( eType == k_ESteamNetworkingSocketsDebugOutputType_Bug )
-    {
-        fflush(stdout);
+    if (eType >= k_ESteamNetworkingSocketsDebugOutputType_Warning) {
+        fprintf(stderr, "SteamNetworking warning: %s\n", pszMsg);
         fflush(stderr);
     }
 }
@@ -89,12 +99,10 @@ void Server::InitSteamDatagramConnectionSockets()
 
     g_logTimeZero = SteamNetworkingUtils()->GetLocalTimestamp();
 
-    SteamNetworkingUtils()->SetDebugOutputFunction( k_ESteamNetworkingSocketsDebugOutputType_Msg, DebugOutput );
+    SteamNetworkingUtils()->SetDebugOutputFunction( k_ESteamNetworkingSocketsDebugOutputType_Warning, DebugOutput );
 }
 
 void Server::OnSteamNetConnectionStatusChanged(SteamNetConnectionStatusChangedCallback_t *pInfo) {
-    char temp[1024];
-
     // What's the state of the connection?
     switch ( pInfo->m_info.m_eState )
     {
@@ -105,44 +113,14 @@ void Server::OnSteamNetConnectionStatusChanged(SteamNetConnectionStatusChangedCa
         case k_ESteamNetworkingConnectionState_ClosedByPeer:
         case k_ESteamNetworkingConnectionState_ProblemDetectedLocally:
         {
-            // Ignore if they were not previously connected.  (If they disconnected
-            // before we accepted the connection.)
-            if ( pInfo->m_eOldState == k_ESteamNetworkingConnectionState_Connected )
-            {
-
-                // Locate the client.  Note that it should have been found, because this
-                // is the only codepath where we remove clients (except on shutdown),
-                // and connection change callbacks are dispatched in queue order.
-
-                // Select appropriate log messages
-                const char *pszDebugLogAction;
-                if ( pInfo->m_info.m_eState == k_ESteamNetworkingConnectionState_ProblemDetectedLocally )
-                {
-                    pszDebugLogAction = "problem detected locally";
-                    sprintf( temp, "Alas, hath fallen into shadow.");
-                }
-                else
-                {
-                    // Note that here we could check the reason code to see if
-                    // it was a "usual" connection or an "unusual" one.
-                    pszDebugLogAction = "closed by peer";
-                    //sprintf( temp, "%s hath departed", itClient->second.m_sNick.c_str() );
-                }
-
-                // Spew something to our own log.  Note that because we put their nick
-                // as the connection description, it will show up, along with their
-                // transport-specific data (e.g. their IP address)
-                printf( "Connection %s %s, reason %d: %s\n",
-                        pInfo->m_info.m_szConnectionDescription,
-                        pszDebugLogAction,
-                        pInfo->m_info.m_eEndReason,
-                        pInfo->m_info.m_szEndDebug
-                );
-
+            const int64 channel = pInfo->m_info.m_nUserData;
+            if (channel != 0) {
+                RemoveConnectionFromChannel(pInfo->m_hConn, channel);
             }
-            else
+
             {
-                assert( pInfo->m_eOldState == k_ESteamNetworkingConnectionState_Connecting );
+                std::lock_guard<std::mutex> lock(sessionMutex);
+                connectionSessions.erase(pInfo->m_hConn);
             }
 
             // Clean up the connection.  This is important!
@@ -160,8 +138,6 @@ void Server::OnSteamNetConnectionStatusChanged(SteamNetConnectionStatusChangedCa
             // This must be a new connection
 
 
-            printf( "Connection request from %s", pInfo->m_info.m_szConnectionDescription );
-
             // A client is attempting to connect
             // Try to accept the connection.
             if ( steamNetworking->AcceptConnection( pInfo->m_hConn ) != k_EResultOK )
@@ -170,7 +146,6 @@ void Server::OnSteamNetConnectionStatusChanged(SteamNetConnectionStatusChangedCa
                 // disconnected, the connection may already be half closed.  Just
                 // destroy whatever we have on our side.
                 steamNetworking->CloseConnection( pInfo->m_hConn, 0, nullptr, false );
-                printf( "Can't accept connection.  (It was already closed?)" );
                 break;
             }
 
@@ -178,35 +153,19 @@ void Server::OnSteamNetConnectionStatusChanged(SteamNetConnectionStatusChangedCa
             if ( !steamNetworking->SetConnectionPollGroup( pInfo->m_hConn, connectionPollGroup ) )
             {
                 steamNetworking->CloseConnection( pInfo->m_hConn, 0, nullptr, false );
-                printf( "Failed to set poll group?" );
                 break;
             }
 
-            // Generate a random nick.  A random temporary nick
-            // is really dumb and not how you would write a real chat server.
-            // You would want them to have some sort of signon message,
-            // and you would keep their client in a state of limbo (connected,
-            // but not logged on) until them.  I'm trying to keep this example
-            // code really simple.
-            char nick[ 64 ];
-            sprintf( nick, "BraveWarrior%d", 10000 + ( rand() % 100000 ) );
-
-            // Send them a welcome message
-            sprintf( temp, "Welcome, stranger.  Thou art known to us for now as '%s'; upon thine command '/nick' we shall know thee otherwise.", nick );
-
-
-
-            // Let everybody else know who they are for now
-            sprintf( temp, "Hark!  A stranger hath joined this merry host.  For now we shall call them '%s'", nick );
-
+            {
+                std::lock_guard<std::mutex> lock(sessionMutex);
+                connectionSessions[pInfo->m_hConn] = SessionInfo{};
+            }
             break;
         }
 
         case k_ESteamNetworkingConnectionState_Connected:
             // We will get a callback immediately after accepting the connection.
             // Since we are the server, we can ignore this, it's not news to us.
-
-            printf( "Client connected, %s", pInfo->m_info.m_szConnectionDescription );
 
             break;
 
@@ -216,8 +175,83 @@ void Server::OnSteamNetConnectionStatusChanged(SteamNetConnectionStatusChangedCa
     }
 }
 
+void Server::RemoveConnectionFromChannel(HSteamNetConnection connection, int64 channel) {
+    std::lock_guard<std::mutex> lock(channelMutex);
+    auto channelIt = channelToConnnectionsMap.find(channel);
+    if (channelIt == channelToConnnectionsMap.end()) {
+        return;
+    }
+    channelIt->second.erase(connection);
+    if (channelIt->second.empty()) {
+        channelToConnnectionsMap.erase(channelIt);
+    }
+}
+
+bool Server::IsAuthenticated(HSteamNetConnection connection) {
+    std::lock_guard<std::mutex> lock(sessionMutex);
+    auto sessionIt = connectionSessions.find(connection);
+    return sessionIt != connectionSessions.end() && sessionIt->second.authenticated;
+}
+
+void Server::SendServerError(HSteamNetConnection connection, int32_t errorCode, const char* message) {
+    ServerErrorMessage errorMessage;
+    errorMessage.errorCode = errorCode;
+    std::snprintf(errorMessage.message, sizeof(errorMessage.message), "%s", message);
+    steamNetworking->SendMessageToConnection(
+        connection,
+        &errorMessage,
+        sizeof(errorMessage),
+        k_nSteamNetworkingSend_ReliableNoNagle,
+        nullptr
+    );
+}
+
+void Server::HandleLoginRequest(HSteamNetConnection connection, const LoginRequest* request, uint32 messageSize) {
+    if (messageSize < sizeof(LoginRequest) || request == nullptr) {
+        SendServerError(connection, ERR_INVALID_REQUEST, "invalid login request");
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(sessionMutex);
+        auto sessionIt = connectionSessions.find(connection);
+        if (sessionIt != connectionSessions.end() && sessionIt->second.authenticated) {
+            SendServerError(connection, ERR_ALREADY_AUTHENTICATED, "already authenticated");
+            return;
+        }
+    }
+
+    LoginResponse response;
+    const auto user = g_userRepository.FindByUsername(request->username);
+    if (user.has_value() && user->status == 1 && PasswordHasher::Verify(request->password, user->passwordHash)) {
+        response.success = 1;
+        response.errorCode = ERR_NONE;
+        response.userId = user->id;
+        std::snprintf(response.displayName, sizeof(response.displayName), "%s", user->displayName.c_str());
+        std::snprintf(response.message, sizeof(response.message), "%s", "login success");
+
+        std::lock_guard<std::mutex> lock(sessionMutex);
+        SessionInfo& session = connectionSessions[connection];
+        session.authenticated = true;
+        session.userId = response.userId;
+        session.username = request->username;
+        session.displayName = response.displayName;
+    } else {
+        response.success = 0;
+        response.errorCode = ERR_UNAUTHENTICATED;
+        std::snprintf(response.message, sizeof(response.message), "%s", "invalid username or password");
+    }
+
+    steamNetworking->SendMessageToConnection(
+        connection,
+        &response,
+        sizeof(response),
+        k_nSteamNetworkingSend_ReliableNoNagle,
+        nullptr
+    );
+}
+
 void Server::PollIncomingMessages() {
-    char temp[ 1024 ];
     SetChannel* setChannel;
     int64 channel;
     ResetCounters();
@@ -244,23 +278,44 @@ void Server::PollIncomingMessages() {
 
         switch (messageType)
         {
+            case LOGIN_REQ:
+                HandleLoginRequest(pIncomingMsg->m_conn, static_cast<LoginRequest*>(pIncomingMsg->m_pData), pIncomingMsg->GetSize());
+                break;
             case SET_CHANNEL:
+                if (!IsAuthenticated(pIncomingMsg->m_conn)) {
+                    SendServerError(pIncomingMsg->m_conn, ERR_UNAUTHENTICATED, "login required before setting channel");
+                    break;
+                }
                 setChannel = (SetChannel*) pIncomingMsg->m_pData;
+                {
+                    const int64 oldChannel = pIncomingMsg->GetConnectionUserData();
+                    if (oldChannel != 0 && oldChannel != setChannel->channel) {
+                        RemoveConnectionFromChannel(pIncomingMsg->m_conn, oldChannel);
+                    }
+                }
                 steamNetworking->SetConnectionUserData(pIncomingMsg->m_conn, setChannel->channel);
-                if (channelToConnnectionsMap.find(setChannel->channel) == channelToConnnectionsMap.end()) {
-                    channelToConnnectionsMap[setChannel->channel] = { pIncomingMsg->m_conn };
+                {
+                    std::lock_guard<std::mutex> lock(channelMutex);
+                    if (channelToConnnectionsMap.find(setChannel->channel) == channelToConnnectionsMap.end()) {
+                        channelToConnnectionsMap[setChannel->channel] = { pIncomingMsg->m_conn };
+                    }
+                    else {
+                        channelToConnnectionsMap[setChannel->channel].insert(pIncomingMsg->m_conn);
+                    }
                 }
-                else {
-                    channelToConnnectionsMap[setChannel->channel].insert(pIncomingMsg->m_conn);
-                }
-                printf("\r set channel received %d", setChannel->channel);
                 break;
             case AUDIO:
+                if (!IsAuthenticated(pIncomingMsg->m_conn)) {
+                    SendServerError(pIncomingMsg->m_conn, ERR_UNAUTHENTICATED, "login required before audio stream");
+                    break;
+                }
                 //printf("size of received data: %u \n", pIncomingMsg->GetSize());
                 channel = pIncomingMsg->GetConnectionUserData();
                 //printf("total connections %d \n", channelToConnnectionsMap[channel].size());
-                if (channelToConnnectionsMap.find(channel) != channelToConnnectionsMap.end()) {
-                    for (auto it = channelToConnnectionsMap[channel].begin(); it != channelToConnnectionsMap[channel].end(); ++it) {
+                {
+                    std::lock_guard<std::mutex> lock(channelMutex);
+                    if (channelToConnnectionsMap.find(channel) != channelToConnnectionsMap.end()) {
+                        for (auto it = channelToConnnectionsMap[channel].begin(); it != channelToConnnectionsMap[channel].end(); ++it) {
                         if (*it == pIncomingMsg->m_conn)
                         {
                             continue;
@@ -269,6 +324,7 @@ void Server::PollIncomingMessages() {
                             k_nSteamNetworkingSend_ReliableNoNagle,
                             nullptr);
                         sentBytesCount += pIncomingMsg->GetSize();
+                        }
                     }
                 }
                 //printf("\r Data received on server, data size = %u bytes", pIncomingMsg->GetSize());

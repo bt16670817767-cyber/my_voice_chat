@@ -40,7 +40,11 @@ int main(int argc, const char* argv[]) {
     auto screen = ftxui::ScreenInteractive::TerminalOutput();
 
     std::thread network_loop([&] {
-        while (!shouldExit.load()) {
+        while (true) {
+            if (shouldExit.load()) {
+                screen.PostEvent(ftxui::Event::Custom);
+                break;
+            }
             server->PollIncomingMessages();
             server->PollConnectionStateChanges();
             sent_kb.store(server->GetSentBytes());
@@ -67,6 +71,10 @@ int main(int argc, const char* argv[]) {
     });
 
     auto app = ftxui::CatchEvent(renderer, [&](ftxui::Event event) {
+        if (event == ftxui::Event::Custom && shouldExit.load()) {
+            screen.ExitLoopClosure()();
+            return true;
+        }
         if (event == ftxui::Event::Character('q') || event == ftxui::Event::Escape) {
             shouldExit = true;
             screen.ExitLoopClosure()();
