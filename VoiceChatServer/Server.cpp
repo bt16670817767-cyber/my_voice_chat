@@ -4,10 +4,12 @@
 #include "Server.h"
 #include "Auth/UserRepository.h"
 #include "Auth/PasswordHasher.h"
+#include "Auth/FriendRepository.h"
+#include "RoomManager.h"
 #include <cstring>
 
 namespace {
-UserRepository g_userRepository("users.db");
+UserRepository g_userRepository("data/users.sqlite");
 }
 
 Server* Server::Instance = nullptr;
@@ -18,6 +20,12 @@ std::map<int64, std::set<HSteamNetConnection>> Server::channelToConnnectionsMap;
 std::map<HSteamNetConnection, Server::SessionInfo> Server::connectionSessions;
 std::mutex Server::sessionMutex;
 std::mutex Server::channelMutex;
+std::unordered_set<int32_t> Server::onlineUsers;
+std::mutex Server::onlineUsersMutex;
+FriendRepository* Server::friendRepo = nullptr;
+RoomManager Server::roomManager;
+std::vector<LogEntry> Server::eventLog;
+std::mutex Server::eventLogMutex;
 
 
 bool Server::StartServer(uint16 port) {
@@ -29,6 +37,12 @@ bool Server::StartServer(uint16 port) {
     steamNetworking = SteamNetworkingSockets();
     if (!g_userRepository.EnsureDefaultData()) {
         printf("Failed to initialize users database file.\n");
+        return false;
+    }
+
+    friendRepo = new FriendRepository("data/users.sqlite");
+    if (!friendRepo->EnsureTables()) {
+        printf("Failed to initialize friendships database.\n");
         return false;
     }
 
@@ -119,16 +133,23 @@ void Server::OnSteamNetConnectionStatusChanged(SteamNetConnectionStatusChangedCa
             }
 
             {
-                std::lock_guard<std::mutex> lock(sessionMutex);
-                connectionSessions.erase(pInfo->m_hConn);
+                int32_t userId = -1;
+                std::string username;
+                {
+                    std::lock_guard<std::mutex> lock(sessionMutex);
+                    auto it = connectionSessions.find(pInfo->m_hConn);
+                    if (it != connectionSessions.end() && it->second.authenticated) {
+                        userId = it->second.userId;
+                        username = it->second.username;
+                    }
+                    connectionSessions.erase(pInfo->m_hConn);
+                }
+                if (userId >= 0) {
+                    AddLogEntry("User disconnected: " + username + " (ID:" + std::to_string(userId) + ")");
+                    HandleUserDisconnect(userId);
+                }
             }
 
-            // Clean up the connection.  This is important!
-            // The connection is "closed" in the network sense, but
-            // it has not been destroyed.  We must close it on our end, too
-            // to finish up.  The reason information do not matter in this case,
-            // and we cannot linger because it's already closed on the other end,
-            // so we just pass 0's.
             steamNetworking->CloseConnection( pInfo->m_hConn, 0, nullptr, false );
             break;
         }
@@ -164,9 +185,7 @@ void Server::OnSteamNetConnectionStatusChanged(SteamNetConnectionStatusChangedCa
         }
 
         case k_ESteamNetworkingConnectionState_Connected:
-            // We will get a callback immediately after accepting the connection.
-            // Since we are the server, we can ignore this, it's not news to us.
-
+            AddLogEntry("New client connected");
             break;
 
         default:
@@ -206,6 +225,80 @@ void Server::SendServerError(HSteamNetConnection connection, int32_t errorCode, 
     );
 }
 
+void Server::HandleRegisterRequest(HSteamNetConnection connection, const RegisterRequest* request, uint32 messageSize) {
+    if (messageSize < sizeof(RegisterRequest) || request == nullptr) {
+        SendServerError(connection, ERR_INVALID_REQUEST, "invalid register request");
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(sessionMutex);
+        auto sessionIt = connectionSessions.find(connection);
+        if (sessionIt != connectionSessions.end() && sessionIt->second.authenticated) {
+            SendServerError(connection, ERR_ALREADY_AUTHENTICATED, "already logged in; logout first to register");
+            return;
+        }
+    }
+
+    const std::string username(request->username);
+    const std::string password(request->password);
+    const std::string displayName(request->displayName);
+
+    if (username.empty() || password.empty()) {
+        RegisterResponse resp;
+        resp.success = 0;
+        resp.errorCode = ERR_INVALID_REQUEST;
+        std::snprintf(resp.message, sizeof(resp.message), "%s", "username and password are required");
+        steamNetworking->SendMessageToConnection(connection, &resp, sizeof(resp), k_nSteamNetworkingSend_ReliableNoNagle, nullptr);
+        return;
+    }
+
+    if (g_userRepository.UsernameExists(username)) {
+        RegisterResponse resp;
+        resp.success = 0;
+        resp.errorCode = ERR_USERNAME_TAKEN;
+        std::snprintf(resp.message, sizeof(resp.message), "%s", "username already taken");
+        steamNetworking->SendMessageToConnection(connection, &resp, sizeof(resp), k_nSteamNetworkingSend_ReliableNoNagle, nullptr);
+        return;
+    }
+
+    const std::string passwordHash = PasswordHasher::HashPassword(password);
+    if (passwordHash.empty()) {
+        RegisterResponse resp;
+        resp.success = 0;
+        resp.errorCode = ERR_INVALID_REQUEST;
+        std::snprintf(resp.message, sizeof(resp.message), "%s", "failed to hash password");
+        steamNetworking->SendMessageToConnection(connection, &resp, sizeof(resp), k_nSteamNetworkingSend_ReliableNoNagle, nullptr);
+        return;
+    }
+
+    const auto user = g_userRepository.CreateUser(username, passwordHash, displayName.empty() ? username : displayName);
+    if (!user.has_value() || user->id < 0) {
+        RegisterResponse resp;
+        resp.success = 0;
+        resp.errorCode = ERR_INVALID_REQUEST;
+        std::snprintf(resp.message, sizeof(resp.message), "%s", "failed to create user");
+        steamNetworking->SendMessageToConnection(connection, &resp, sizeof(resp), k_nSteamNetworkingSend_ReliableNoNagle, nullptr);
+        return;
+    }
+
+    RegisterResponse resp;
+    resp.success = 1;
+    resp.errorCode = ERR_NONE;
+    resp.userId = user->id;
+    std::snprintf(resp.message, sizeof(resp.message), "%s", "registration successful; please login");
+
+    AddLogEntry("New user registered: " + username + " (ID:" + std::to_string(user->id) + ")");
+
+    steamNetworking->SendMessageToConnection(
+        connection,
+        &resp,
+        sizeof(resp),
+        k_nSteamNetworkingSend_ReliableNoNagle,
+        nullptr
+    );
+}
+
 void Server::HandleLoginRequest(HSteamNetConnection connection, const LoginRequest* request, uint32 messageSize) {
     if (messageSize < sizeof(LoginRequest) || request == nullptr) {
         SendServerError(connection, ERR_INVALID_REQUEST, "invalid login request");
@@ -223,23 +316,33 @@ void Server::HandleLoginRequest(HSteamNetConnection connection, const LoginReque
 
     LoginResponse response;
     const auto user = g_userRepository.FindByUsername(request->username);
-    if (user.has_value() && user->status == 1 && PasswordHasher::Verify(request->password, user->passwordHash)) {
+    if (user.has_value() && user->status == 1 && PasswordHasher::VerifyPassword(request->password, user->passwordHash)) {
         response.success = 1;
         response.errorCode = ERR_NONE;
         response.userId = user->id;
         std::snprintf(response.displayName, sizeof(response.displayName), "%s", user->displayName.c_str());
         std::snprintf(response.message, sizeof(response.message), "%s", "login success");
 
-        std::lock_guard<std::mutex> lock(sessionMutex);
-        SessionInfo& session = connectionSessions[connection];
-        session.authenticated = true;
-        session.userId = response.userId;
-        session.username = request->username;
-        session.displayName = response.displayName;
+        {
+            std::lock_guard<std::mutex> lock(sessionMutex);
+            SessionInfo& session = connectionSessions[connection];
+            session.authenticated = true;
+            session.userId = response.userId;
+            session.username = request->username;
+            session.displayName = response.displayName;
+        }
+
+        {
+            std::lock_guard<std::mutex> ol(onlineUsersMutex);
+            onlineUsers.insert(response.userId);
+        }
+        NotifyFriendsStatusChange(response.userId, true);
+        AddLogEntry("User logged in: " + std::string(request->username) + " (ID:" + std::to_string(response.userId) + ")");
     } else {
         response.success = 0;
         response.errorCode = ERR_UNAUTHENTICATED;
         std::snprintf(response.message, sizeof(response.message), "%s", "invalid username or password");
+        AddLogEntry("Failed login attempt for user: " + std::string(request->username));
     }
 
     steamNetworking->SendMessageToConnection(
@@ -267,7 +370,8 @@ void Server::PollIncomingMessages() {
 
         if (pIncomingMsg->m_pData == NULL){
             printf("received null data!\n");
-            break;
+            pIncomingMsg->Release();
+            continue;
         }
 
         uint8_t messageType = ((uint8_t*)pIncomingMsg->m_pData)[0];
@@ -280,6 +384,57 @@ void Server::PollIncomingMessages() {
         {
             case LOGIN_REQ:
                 HandleLoginRequest(pIncomingMsg->m_conn, static_cast<LoginRequest*>(pIncomingMsg->m_pData), pIncomingMsg->GetSize());
+                break;
+            case REGISTER_REQ:
+                HandleRegisterRequest(pIncomingMsg->m_conn, static_cast<RegisterRequest*>(pIncomingMsg->m_pData), pIncomingMsg->GetSize());
+                break;
+            case FRIEND_SEARCH_REQ:
+                if (!IsAuthenticated(pIncomingMsg->m_conn)) { SendServerError(pIncomingMsg->m_conn, ERR_UNAUTHENTICATED, "login required"); break; }
+                HandleFriendSearchRequest(pIncomingMsg->m_conn, static_cast<FriendSearchRequest*>(pIncomingMsg->m_pData));
+                break;
+            case FRIEND_ADD_REQ:
+                if (!IsAuthenticated(pIncomingMsg->m_conn)) { SendServerError(pIncomingMsg->m_conn, ERR_UNAUTHENTICATED, "login required"); break; }
+                HandleFriendAddRequest(pIncomingMsg->m_conn, static_cast<FriendAddRequest*>(pIncomingMsg->m_pData));
+                break;
+            case FRIEND_ACCEPT_REQ:
+                if (!IsAuthenticated(pIncomingMsg->m_conn)) { SendServerError(pIncomingMsg->m_conn, ERR_UNAUTHENTICATED, "login required"); break; }
+                HandleFriendAcceptRequest(pIncomingMsg->m_conn, static_cast<FriendAcceptRequest*>(pIncomingMsg->m_pData));
+                break;
+            case FRIEND_REJECT_REQ:
+                if (!IsAuthenticated(pIncomingMsg->m_conn)) { SendServerError(pIncomingMsg->m_conn, ERR_UNAUTHENTICATED, "login required"); break; }
+                HandleFriendRejectRequest(pIncomingMsg->m_conn, static_cast<FriendRejectRequest*>(pIncomingMsg->m_pData));
+                break;
+            case FRIEND_LIST_REQ:
+                if (!IsAuthenticated(pIncomingMsg->m_conn)) { SendServerError(pIncomingMsg->m_conn, ERR_UNAUTHENTICATED, "login required"); break; }
+                HandleFriendListRequest(pIncomingMsg->m_conn);
+                break;
+            case FRIEND_REMOVE_REQ:
+                if (!IsAuthenticated(pIncomingMsg->m_conn)) { SendServerError(pIncomingMsg->m_conn, ERR_UNAUTHENTICATED, "login required"); break; }
+                HandleFriendRemoveRequest(pIncomingMsg->m_conn, static_cast<FriendRemoveRequest*>(pIncomingMsg->m_pData));
+                break;
+            case FRIEND_SENT_REQ:
+                if (!IsAuthenticated(pIncomingMsg->m_conn)) { SendServerError(pIncomingMsg->m_conn, ERR_UNAUTHENTICATED, "login required"); break; }
+                HandleFriendSentRequests(pIncomingMsg->m_conn);
+                break;
+            case ROOM_CREATE_REQ:
+                if (!IsAuthenticated(pIncomingMsg->m_conn)) { SendServerError(pIncomingMsg->m_conn, ERR_UNAUTHENTICATED, "login required"); break; }
+                HandleRoomCreateRequest(pIncomingMsg->m_conn, static_cast<RoomCreateRequest*>(pIncomingMsg->m_pData));
+                break;
+            case ROOM_INVITE_REQ:
+                if (!IsAuthenticated(pIncomingMsg->m_conn)) { SendServerError(pIncomingMsg->m_conn, ERR_UNAUTHENTICATED, "login required"); break; }
+                HandleRoomInviteRequest(pIncomingMsg->m_conn, static_cast<RoomInviteRequest*>(pIncomingMsg->m_pData));
+                break;
+            case ROOM_JOIN_REQ:
+                if (!IsAuthenticated(pIncomingMsg->m_conn)) { SendServerError(pIncomingMsg->m_conn, ERR_UNAUTHENTICATED, "login required"); break; }
+                HandleRoomJoinRequest(pIncomingMsg->m_conn, static_cast<RoomJoinRequest*>(pIncomingMsg->m_pData));
+                break;
+            case ROOM_LEAVE_REQ:
+                if (!IsAuthenticated(pIncomingMsg->m_conn)) { SendServerError(pIncomingMsg->m_conn, ERR_UNAUTHENTICATED, "login required"); break; }
+                HandleRoomLeaveRequest(pIncomingMsg->m_conn, static_cast<RoomLeaveRequest*>(pIncomingMsg->m_pData));
+                break;
+            case ROOM_LIST_REQ:
+                if (!IsAuthenticated(pIncomingMsg->m_conn)) { SendServerError(pIncomingMsg->m_conn, ERR_UNAUTHENTICATED, "login required"); break; }
+                HandleRoomListRequest(pIncomingMsg->m_conn);
                 break;
             case SET_CHANNEL:
                 if (!IsAuthenticated(pIncomingMsg->m_conn)) {
@@ -309,9 +464,14 @@ void Server::PollIncomingMessages() {
                     SendServerError(pIncomingMsg->m_conn, ERR_UNAUTHENTICATED, "login required before audio stream");
                     break;
                 }
-                //printf("size of received data: %u \n", pIncomingMsg->GetSize());
+                {
+                    int32_t senderUserId = GetUserIdFromConnection(pIncomingMsg->m_conn);
+                    if (senderUserId >= 0 && pIncomingMsg->GetSize() >= sizeof(AudioData)) {
+                        auto* audioData = static_cast<AudioData*>(pIncomingMsg->m_pData);
+                        audioData->senderUserId = senderUserId;
+                    }
+                }
                 channel = pIncomingMsg->GetConnectionUserData();
-                //printf("total connections %d \n", channelToConnnectionsMap[channel].size());
                 {
                     std::lock_guard<std::mutex> lock(channelMutex);
                     if (channelToConnnectionsMap.find(channel) != channelToConnnectionsMap.end()) {
@@ -327,16 +487,12 @@ void Server::PollIncomingMessages() {
                         }
                     }
                 }
-                //printf("\r Data received on server, data size = %u bytes", pIncomingMsg->GetSize());
                 break;
             default:
                 break;
         }
 
-        // We don't need this anymore.
         pIncomingMsg->Release();
-
-
     }
 }
 
@@ -344,14 +500,14 @@ void Server::PollConnectionStateChanges() {
     steamNetworking->RunCallbacks();
 }
 
-uint16 Server::GetSentBytes()
+uint64 Server::GetSentBytes()
 {
-    return sentBytesCount * 8 / 1024;
+    return sentBytesCount;
 }
 
-uint16 Server::GetRecievedBytes()
+uint64 Server::GetRecievedBytes()
 {
-    return receivedBytesCount * 8 / 1024;
+    return receivedBytesCount;
 }
 
 bool Server::ResetCounters()
@@ -359,4 +515,606 @@ bool Server::ResetCounters()
     sentBytesCount = 0;
     receivedBytesCount = 0;
     return true;
+}
+
+size_t Server::GetConnectedUserCount() const {
+    std::lock_guard<std::mutex> lock(sessionMutex);
+    return connectionSessions.size();
+}
+
+std::vector<UserInfo> Server::GetConnectedUsers() const {
+    std::lock_guard<std::mutex> lock(sessionMutex);
+    std::vector<UserInfo> result;
+    for (const auto& pair : connectionSessions) {
+        UserInfo info;
+        info.userId = pair.second.userId;
+        info.username = pair.second.username;
+        info.displayName = pair.second.displayName;
+        info.activeRoomCount = static_cast<int32_t>(pair.second.activeRoomIds.size());
+        result.push_back(info);
+    }
+    return result;
+}
+
+std::vector<ChannelInfo> Server::GetActiveChannels() const {
+    std::lock_guard<std::mutex> lock(channelMutex);
+    std::vector<ChannelInfo> result;
+    for (const auto& pair : channelToConnnectionsMap) {
+        ChannelInfo info;
+        info.channelId = pair.first;
+        info.connectionCount = pair.second.size();
+        result.push_back(info);
+    }
+    return result;
+}
+
+std::vector<RoomSummary> Server::GetAllRooms() const {
+    auto rooms = roomManager.GetAllRooms();
+    std::vector<RoomSummary> result;
+    for (const auto& room : rooms) {
+        RoomSummary summary;
+        summary.roomId = room.roomId;
+        summary.roomName = room.roomName;
+        summary.memberCount = room.memberUserIds.size();
+        summary.ownerUserId = room.ownerUserId;
+        result.push_back(summary);
+    }
+    return result;
+}
+
+std::vector<LogEntry> Server::GetRecentLogEntries() const {
+    std::lock_guard<std::mutex> lock(eventLogMutex);
+    return eventLog;
+}
+
+void Server::AddLogEntry(const std::string& message) {
+    std::lock_guard<std::mutex> lock(eventLogMutex);
+    auto now = std::chrono::system_clock::now();
+    auto time_t = std::chrono::system_clock::to_time_t(now);
+    char timeBuf[32];
+    std::strftime(timeBuf, sizeof(timeBuf), "%H:%M:%S", std::localtime(&time_t));
+    eventLog.push_back({timeBuf, message});
+    if (eventLog.size() > MAX_LOG_ENTRIES) {
+        eventLog.erase(eventLog.begin(), eventLog.begin() + (eventLog.size() - MAX_LOG_ENTRIES));
+    }
+}
+
+// --- Friend handlers ---
+
+void Server::HandleFriendSearchRequest(HSteamNetConnection connection, const FriendSearchRequest* request) {
+    int32_t userId = GetUserIdFromConnection(connection);
+    if (userId < 0) return;
+
+    const auto results = friendRepo->SearchUsers(request->query, userId, MAX_SEARCH_RESULTS);
+
+    FriendSearchResult resp;
+    resp.resultCount = static_cast<uint8_t>(results.size());
+    for (size_t i = 0; i < results.size() && i < MAX_SEARCH_RESULTS; ++i) {
+        resp.userIds[i] = results[i].userId;
+        std::snprintf(resp.usernames[i], sizeof(resp.usernames[i]), "%s", results[i].username.c_str());
+        std::snprintf(resp.displayNames[i], sizeof(resp.displayNames[i]), "%s", results[i].displayName.c_str());
+        resp.relationshipStatus[i] = static_cast<uint8_t>(results[i].relationshipStatus);
+        {
+            std::lock_guard<std::mutex> lock(onlineUsersMutex);
+            resp.isOnline[i] = onlineUsers.count(results[i].userId) > 0 ? 1 : 0;
+        }
+    }
+
+    steamNetworking->SendMessageToConnection(connection, &resp, sizeof(resp), k_nSteamNetworkingSend_ReliableNoNagle, nullptr);
+}
+
+void Server::HandleFriendAddRequest(HSteamNetConnection connection, const FriendAddRequest* request) {
+    int32_t userId = GetUserIdFromConnection(connection);
+    if (userId < 0) return;
+
+    int32_t targetId = request->targetUserId;
+    if (targetId < 0) {
+        SendServerError(connection, ERR_USER_NOT_FOUND, "user not found");
+        return;
+    }
+    if (targetId == userId) {
+        SendServerError(connection, ERR_CANNOT_FRIEND_SELF, "cannot add yourself as friend");
+        return;
+    }
+
+    int rel = friendRepo->GetRelationshipStatus(userId, targetId);
+    if (rel == 1) {
+        SendServerError(connection, ERR_ALREADY_FRIENDS, "already friends");
+        return;
+    }
+    if (rel == 2) {
+        SendServerError(connection, ERR_ALREADY_REQUESTED, "friend request already sent");
+        return;
+    }
+
+    // If there's an incoming request from the target, auto-accept instead
+    if (rel == 3) {
+        friendRepo->AcceptFriendRequest(targetId, userId);
+        FriendAcceptResponse resp;
+        resp.success = 1;
+        resp.friendUserId = targetId;
+        steamNetworking->SendMessageToConnection(connection, &resp, sizeof(resp), k_nSteamNetworkingSend_ReliableNoNagle, nullptr);
+
+        // Notify original requester
+        HSteamNetConnection targetConn = FindConnectionByUserId(targetId);
+        if (targetConn != k_HSteamNetConnection_Invalid) {
+            FriendAcceptResponse notify;
+            notify.success = 1;
+            notify.friendUserId = userId;
+            steamNetworking->SendMessageToConnection(targetConn, &notify, sizeof(notify), k_nSteamNetworkingSend_ReliableNoNagle, nullptr);
+        }
+        return;
+    }
+
+    // Verify target user exists
+    auto targetUser = g_userRepository.FindByUsername(""); // need to check existence - use relationship check which already verifies user exists
+    // Send friend request
+    if (!friendRepo->SendFriendRequest(userId, targetId)) {
+        SendServerError(connection, ERR_USER_NOT_FOUND, "failed to send friend request");
+        return;
+    }
+
+    FriendAddResponse resp;
+    resp.success = 1;
+    resp.errorCode = ERR_NONE;
+    resp.targetUserId = targetId;
+    std::snprintf(resp.message, sizeof(resp.message), "%s", "friend request sent");
+
+    steamNetworking->SendMessageToConnection(connection, &resp, sizeof(resp), k_nSteamNetworkingSend_ReliableNoNagle, nullptr);
+
+    // Notify target user if online
+    HSteamNetConnection targetConn = FindConnectionByUserId(targetId);
+    if (targetConn != k_HSteamNetConnection_Invalid) {
+        FriendRequestNotify notify;
+        notify.fromUserId = userId;
+        {
+            std::lock_guard<std::mutex> lock(sessionMutex);
+            auto it = connectionSessions.find(connection);
+            if (it != connectionSessions.end()) {
+                std::snprintf(notify.fromUsername, sizeof(notify.fromUsername), "%s", it->second.username.c_str());
+                std::snprintf(notify.fromDisplayName, sizeof(notify.fromDisplayName), "%s", it->second.displayName.c_str());
+            }
+        }
+        steamNetworking->SendMessageToConnection(targetConn, &notify, sizeof(notify), k_nSteamNetworkingSend_ReliableNoNagle, nullptr);
+    }
+}
+
+void Server::HandleFriendAcceptRequest(HSteamNetConnection connection, const FriendAcceptRequest* request) {
+    int32_t userId = GetUserIdFromConnection(connection);
+    if (userId < 0) return;
+
+    int32_t fromUserId = request->fromUserId;
+    if (fromUserId < 0) {
+        SendServerError(connection, ERR_USER_NOT_FOUND, "user not found");
+        return;
+    }
+
+    if (!friendRepo->AcceptFriendRequest(fromUserId, userId)) {
+        SendServerError(connection, ERR_INVALID_REQUEST, "no pending friend request");
+        return;
+    }
+
+    // Get the new friend's display name
+    auto friendUser = g_userRepository.FindById(fromUserId);
+    std::string friendDisplayName = friendUser.has_value() ? friendUser->displayName : "";
+
+    FriendAcceptResponse resp;
+    resp.success = 1;
+    resp.friendUserId = fromUserId;
+    std::snprintf(resp.friendDisplayName, sizeof(resp.friendDisplayName), "%s", friendDisplayName.c_str());
+    std::snprintf(resp.message, sizeof(resp.message), "%s", "friend request accepted");
+
+    steamNetworking->SendMessageToConnection(connection, &resp, sizeof(resp), k_nSteamNetworkingSend_ReliableNoNagle, nullptr);
+
+    // Notify the original requester if online
+    HSteamNetConnection requesterConn = FindConnectionByUserId(fromUserId);
+    if (requesterConn != k_HSteamNetConnection_Invalid) {
+        FriendAcceptResponse notify;
+        notify.success = 1;
+        notify.friendUserId = userId;
+        {
+            std::lock_guard<std::mutex> lock(sessionMutex);
+            auto it = connectionSessions.find(connection);
+            if (it != connectionSessions.end()) {
+                std::snprintf(notify.friendDisplayName, sizeof(notify.friendDisplayName), "%s", it->second.displayName.c_str());
+            }
+        }
+        std::snprintf(notify.message, sizeof(notify.message), "%s", "friend request accepted");
+        steamNetworking->SendMessageToConnection(requesterConn, &notify, sizeof(notify), k_nSteamNetworkingSend_ReliableNoNagle, nullptr);
+    }
+}
+
+void Server::HandleFriendRejectRequest(HSteamNetConnection connection, const FriendRejectRequest* request) {
+    int32_t userId = GetUserIdFromConnection(connection);
+    if (userId < 0) return;
+
+    friendRepo->RejectFriendRequest(request->fromUserId, userId);
+
+    FriendRejectResponse resp;
+    resp.success = 1;
+    std::snprintf(resp.message, sizeof(resp.message), "%s", "friend request rejected");
+
+    steamNetworking->SendMessageToConnection(connection, &resp, sizeof(resp), k_nSteamNetworkingSend_ReliableNoNagle, nullptr);
+}
+
+void Server::HandleFriendListRequest(HSteamNetConnection connection) {
+    int32_t userId = GetUserIdFromConnection(connection);
+    if (userId < 0) return;
+
+    const auto friends = friendRepo->GetFriends(userId);
+
+    FriendListResponse resp;
+    resp.friendCount = static_cast<uint8_t>(friends.size() < MAX_FRIENDS_PER_MSG ? friends.size() : MAX_FRIENDS_PER_MSG);
+    for (size_t i = 0; i < resp.friendCount; ++i) {
+        resp.userIds[i] = friends[i].userId;
+        std::snprintf(resp.usernames[i], sizeof(resp.usernames[i]), "%s", friends[i].username.c_str());
+        std::snprintf(resp.displayNames[i], sizeof(resp.displayNames[i]), "%s", friends[i].displayName.c_str());
+        {
+            std::lock_guard<std::mutex> lock(onlineUsersMutex);
+            resp.isOnline[i] = onlineUsers.count(friends[i].userId) > 0 ? 1 : 0;
+        }
+    }
+
+    steamNetworking->SendMessageToConnection(connection, &resp, sizeof(resp), k_nSteamNetworkingSend_ReliableNoNagle, nullptr);
+}
+
+void Server::HandleFriendRemoveRequest(HSteamNetConnection connection, const FriendRemoveRequest* request) {
+    int32_t userId = GetUserIdFromConnection(connection);
+    if (userId < 0) return;
+
+    friendRepo->RemoveFriend(userId, request->friendUserId);
+
+    FriendRemoveResponse resp;
+    resp.success = 1;
+    std::snprintf(resp.message, sizeof(resp.message), "%s", "friend removed");
+
+    steamNetworking->SendMessageToConnection(connection, &resp, sizeof(resp), k_nSteamNetworkingSend_ReliableNoNagle, nullptr);
+}
+
+void Server::HandleFriendSentRequests(HSteamNetConnection connection) {
+    int32_t userId = GetUserIdFromConnection(connection);
+    if (userId < 0) return;
+
+    const auto sent = friendRepo->GetSentRequests(userId);
+
+    FriendSentResponse resp;
+    resp.count = static_cast<uint8_t>(sent.size() < MAX_SENT_REQUESTS ? sent.size() : MAX_SENT_REQUESTS);
+    for (size_t i = 0; i < resp.count; ++i) {
+        resp.userIds[i] = sent[i].userId;
+        std::snprintf(resp.usernames[i], sizeof(resp.usernames[i]), "%s", sent[i].username.c_str());
+        std::snprintf(resp.displayNames[i], sizeof(resp.displayNames[i]), "%s", sent[i].displayName.c_str());
+    }
+
+    steamNetworking->SendMessageToConnection(connection, &resp, sizeof(resp), k_nSteamNetworkingSend_ReliableNoNagle, nullptr);
+}
+
+// --- Helpers ---
+
+int32_t Server::GetUserIdFromConnection(HSteamNetConnection connection) {
+    std::lock_guard<std::mutex> lock(sessionMutex);
+    auto it = connectionSessions.find(connection);
+    if (it == connectionSessions.end() || !it->second.authenticated) return -1;
+    return it->second.userId;
+}
+
+HSteamNetConnection Server::FindConnectionByUserId(int32_t userId) {
+    std::lock_guard<std::mutex> lock(sessionMutex);
+    for (const auto& pair : connectionSessions) {
+        if (pair.second.authenticated && pair.second.userId == userId) {
+            return pair.first;
+        }
+    }
+    return k_HSteamNetConnection_Invalid;
+}
+
+void Server::SendMessageToUser(int32_t userId, const void* data, uint32 size) {
+    HSteamNetConnection conn = FindConnectionByUserId(userId);
+    if (conn != k_HSteamNetConnection_Invalid) {
+        steamNetworking->SendMessageToConnection(conn, data, size, k_nSteamNetworkingSend_ReliableNoNagle, nullptr);
+    }
+}
+
+void Server::NotifyFriendsStatusChange(int32_t userId, bool isOnline) {
+    const auto friendIds = friendRepo->GetFriendIds(userId);
+
+    FriendOnlineNotify notify;
+    notify.userId = userId;
+    notify.isOnline = isOnline ? 1 : 0;
+
+    for (int32_t friendId : friendIds) {
+        SendMessageToUser(friendId, &notify, sizeof(notify));
+    }
+}
+
+void Server::HandleUserDisconnect(int32_t userId) {
+    // Remove from all rooms
+    auto activeRoomIds = roomManager.GetUserActiveRoomIds(userId);
+    for (int32_t roomId : activeRoomIds) {
+        roomManager.RemoveMember(roomId, userId);
+
+        // Notify other members
+        RoomMemberUpdate update;
+        update.roomId = roomId;
+        const auto* room = roomManager.GetRoom(roomId);
+        if (room) {
+            update.memberCount = static_cast<uint8_t>(room->memberUserIds.size() < MAX_ROOM_MEMBERS ? room->memberUserIds.size() : MAX_ROOM_MEMBERS);
+            int idx = 0;
+            for (int32_t memberId : room->memberUserIds) {
+                if (idx >= MAX_ROOM_MEMBERS) break;
+                update.userIds[idx] = memberId;
+                // Get display name from session
+                HSteamNetConnection memberConn = FindConnectionByUserId(memberId);
+                if (memberConn != k_HSteamNetConnection_Invalid) {
+                    std::lock_guard<std::mutex> lock(sessionMutex);
+                    auto it = connectionSessions.find(memberConn);
+                    if (it != connectionSessions.end()) {
+                        std::snprintf(update.displayNames[idx], sizeof(update.displayNames[idx]), "%s", it->second.displayName.c_str());
+                    }
+                }
+                ++idx;
+            }
+            // Broadcast update to remaining members
+            for (int32_t memberId : room->memberUserIds) {
+                SendMessageToUser(memberId, &update, sizeof(update));
+            }
+
+            // Delete room if empty
+            if (room->memberUserIds.empty()) {
+                roomManager.DeleteRoom(roomId);
+            }
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(onlineUsersMutex);
+        onlineUsers.erase(userId);
+    }
+    NotifyFriendsStatusChange(userId, false);
+}
+
+// --- Room handlers ---
+
+void Server::HandleRoomCreateRequest(HSteamNetConnection connection, const RoomCreateRequest* request) {
+    int32_t userId = GetUserIdFromConnection(connection);
+    if (userId < 0) return;
+
+    std::string roomName(request->roomName);
+    std::string password(request->password);
+    int32_t roomId = roomManager.CreateRoom(userId, roomName, password);
+    const auto* room = roomManager.GetRoom(roomId);
+    if (!room) {
+        SendServerError(connection, ERR_INVALID_REQUEST, "failed to create room");
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(sessionMutex);
+        auto it = connectionSessions.find(connection);
+        if (it != connectionSessions.end()) {
+            it->second.activeRoomIds.insert(roomId);
+        }
+    }
+
+    // Auto-join the channel for this room
+    steamNetworking->SetConnectionUserData(connection, room->channel);
+    {
+        std::lock_guard<std::mutex> lock(channelMutex);
+        channelToConnnectionsMap[room->channel] = { connection };
+    }
+
+    RoomCreateResponse resp;
+    resp.success = 1;
+    resp.roomId = roomId;
+    resp.channel = room->channel;
+    std::snprintf(resp.roomName, sizeof(resp.roomName), "%s", room->roomName.c_str());
+    std::snprintf(resp.message, sizeof(resp.message), "%s", "room created");
+
+    steamNetworking->SendMessageToConnection(connection, &resp, sizeof(resp), k_nSteamNetworkingSend_ReliableNoNagle, nullptr);
+}
+
+void Server::HandleRoomInviteRequest(HSteamNetConnection connection, const RoomInviteRequest* request) {
+    int32_t userId = GetUserIdFromConnection(connection);
+    if (userId < 0) return;
+
+    const auto* room = roomManager.GetRoom(request->roomId);
+    if (!room) {
+        SendServerError(connection, ERR_ROOM_NOT_FOUND, "room not found");
+        return;
+    }
+    if (!roomManager.IsMember(request->roomId, userId)) {
+        SendServerError(connection, ERR_NOT_ROOM_MEMBER, "you are not a member of this room");
+        return;
+    }
+
+    roomManager.AddInvite(request->roomId, request->targetUserId);
+
+    RoomInviteResponse resp;
+    resp.success = 1;
+    std::snprintf(resp.message, sizeof(resp.message), "%s", "invitation sent");
+    steamNetworking->SendMessageToConnection(connection, &resp, sizeof(resp), k_nSteamNetworkingSend_ReliableNoNagle, nullptr);
+
+    // Notify target user
+    HSteamNetConnection targetConn = FindConnectionByUserId(request->targetUserId);
+    if (targetConn != k_HSteamNetConnection_Invalid) {
+        RoomInviteNotify notify;
+        notify.roomId = request->roomId;
+        notify.channel = room->channel;
+        notify.fromUserId = userId;
+        std::snprintf(notify.roomName, sizeof(notify.roomName), "%s", room->roomName.c_str());
+        {
+            std::lock_guard<std::mutex> lock(sessionMutex);
+            auto it = connectionSessions.find(connection);
+            if (it != connectionSessions.end()) {
+                std::snprintf(notify.fromDisplayName, sizeof(notify.fromDisplayName), "%s", it->second.displayName.c_str());
+            }
+        }
+        steamNetworking->SendMessageToConnection(targetConn, &notify, sizeof(notify), k_nSteamNetworkingSend_ReliableNoNagle, nullptr);
+    }
+}
+
+void Server::HandleRoomJoinRequest(HSteamNetConnection connection, const RoomJoinRequest* request) {
+    int32_t userId = GetUserIdFromConnection(connection);
+    if (userId < 0) return;
+
+    const auto* room = roomManager.GetRoom(request->roomId);
+    if (!room) {
+        SendServerError(connection, ERR_ROOM_NOT_FOUND, "room not found");
+        return;
+    }
+
+    if (roomManager.IsMember(request->roomId, userId)) {
+        SendServerError(connection, ERR_ALREADY_AUTHENTICATED, "already a member of this room");
+        return;
+    }
+
+    // Allow joining by invitation OR by correct password
+    const bool invited = roomManager.IsInvited(request->roomId, userId);
+    const bool hasPassword = !room->password.empty();
+    const bool passwordMatch = hasPassword && (std::string(request->password) == room->password);
+
+    if (!invited && !passwordMatch) {
+        if (hasPassword) {
+            SendServerError(connection, ERR_NOT_INVITED, "invalid room password");
+        } else {
+            SendServerError(connection, ERR_NOT_INVITED, "you have not been invited to this room");
+        }
+        return;
+    }
+
+    // Add as member
+    roomManager.AddMember(request->roomId, userId);
+    {
+        std::lock_guard<std::mutex> lock(sessionMutex);
+        auto it = connectionSessions.find(connection);
+        if (it != connectionSessions.end()) {
+            it->second.activeRoomIds.insert(request->roomId);
+        }
+    }
+
+    // Switch to room's audio channel
+    const int64 oldChannel = steamNetworking->GetConnectionUserData(connection);
+    if (oldChannel != 0 && oldChannel != room->channel) {
+        RemoveConnectionFromChannel(connection, oldChannel);
+    }
+    steamNetworking->SetConnectionUserData(connection, room->channel);
+    {
+        std::lock_guard<std::mutex> lock(channelMutex);
+        channelToConnnectionsMap[room->channel].insert(connection);
+    }
+
+    RoomJoinResponse resp;
+    resp.success = 1;
+    resp.roomId = request->roomId;
+    resp.channel = room->channel;
+    std::snprintf(resp.roomName, sizeof(resp.roomName), "%s", room->roomName.c_str());
+    std::snprintf(resp.message, sizeof(resp.message), "%s", "joined room");
+
+    steamNetworking->SendMessageToConnection(connection, &resp, sizeof(resp), k_nSteamNetworkingSend_ReliableNoNagle, nullptr);
+
+    // Notify other members
+    const auto* updatedRoom = roomManager.GetRoom(request->roomId);
+    if (updatedRoom) {
+        RoomMemberUpdate update;
+        update.roomId = request->roomId;
+        update.roomChannel = room->channel;
+        update.memberCount = static_cast<uint8_t>(updatedRoom->memberUserIds.size() < MAX_ROOM_MEMBERS ? updatedRoom->memberUserIds.size() : MAX_ROOM_MEMBERS);
+        int idx = 0;
+        for (int32_t memberId : updatedRoom->memberUserIds) {
+            if (idx >= MAX_ROOM_MEMBERS) break;
+            update.userIds[idx] = memberId;
+            HSteamNetConnection memberConn = FindConnectionByUserId(memberId);
+            if (memberConn != k_HSteamNetConnection_Invalid) {
+                std::lock_guard<std::mutex> lock(sessionMutex);
+                auto it = connectionSessions.find(memberConn);
+                if (it != connectionSessions.end()) {
+                    std::snprintf(update.displayNames[idx], sizeof(update.displayNames[idx]), "%s", it->second.displayName.c_str());
+                }
+            }
+            ++idx;
+        }
+        for (int32_t memberId : updatedRoom->memberUserIds) {
+            SendMessageToUser(memberId, &update, sizeof(update));
+        }
+    }
+}
+
+void Server::HandleRoomLeaveRequest(HSteamNetConnection connection, const RoomLeaveRequest* request) {
+    int32_t userId = GetUserIdFromConnection(connection);
+    if (userId < 0) return;
+
+    const auto* room = roomManager.GetRoom(request->roomId);
+    if (!room || !roomManager.IsMember(request->roomId, userId)) {
+        SendServerError(connection, ERR_NOT_ROOM_MEMBER, "not a member of this room");
+        return;
+    }
+
+    // Clear channel
+    const int64 oldChannel = steamNetworking->GetConnectionUserData(connection);
+    if (oldChannel != 0) {
+        RemoveConnectionFromChannel(connection, oldChannel);
+    }
+    steamNetworking->SetConnectionUserData(connection, 0);
+
+    roomManager.RemoveMember(request->roomId, userId);
+    {
+        std::lock_guard<std::mutex> lock(sessionMutex);
+        auto it = connectionSessions.find(connection);
+        if (it != connectionSessions.end()) {
+            it->second.activeRoomIds.erase(request->roomId);
+        }
+    }
+
+    RoomLeaveResponse resp;
+    resp.success = 1;
+    std::snprintf(resp.message, sizeof(resp.message), "%s", "left room");
+    steamNetworking->SendMessageToConnection(connection, &resp, sizeof(resp), k_nSteamNetworkingSend_ReliableNoNagle, nullptr);
+
+    // Notify remaining members
+    const auto* updatedRoom = roomManager.GetRoom(request->roomId);
+    if (updatedRoom && !updatedRoom->memberUserIds.empty()) {
+        RoomMemberUpdate update;
+        update.roomId = request->roomId;
+        update.memberCount = static_cast<uint8_t>(updatedRoom->memberUserIds.size() < MAX_ROOM_MEMBERS ? updatedRoom->memberUserIds.size() : MAX_ROOM_MEMBERS);
+        int idx = 0;
+        for (int32_t memberId : updatedRoom->memberUserIds) {
+            if (idx >= MAX_ROOM_MEMBERS) break;
+            update.userIds[idx] = memberId;
+            HSteamNetConnection memberConn = FindConnectionByUserId(memberId);
+            if (memberConn != k_HSteamNetConnection_Invalid) {
+                std::lock_guard<std::mutex> lock(sessionMutex);
+                auto it = connectionSessions.find(memberConn);
+                if (it != connectionSessions.end()) {
+                    std::snprintf(update.displayNames[idx], sizeof(update.displayNames[idx]), "%s", it->second.displayName.c_str());
+                }
+            }
+            ++idx;
+        }
+        for (int32_t memberId : updatedRoom->memberUserIds) {
+            SendMessageToUser(memberId, &update, sizeof(update));
+        }
+    } else {
+        // Delete empty room
+        roomManager.DeleteRoom(request->roomId);
+    }
+}
+
+void Server::HandleRoomListRequest(HSteamNetConnection connection) {
+    int32_t userId = GetUserIdFromConnection(connection);
+    if (userId < 0) return;
+
+    const auto rooms = roomManager.GetRoomsForUser(userId);
+
+    RoomListResponse resp;
+    resp.roomCount = static_cast<uint8_t>(rooms.size() < MAX_ROOMS_PER_MSG ? rooms.size() : MAX_ROOMS_PER_MSG);
+    for (size_t i = 0; i < resp.roomCount; ++i) {
+        resp.roomIds[i] = rooms[i].roomId;
+        resp.channels[i] = rooms[i].channel;
+        std::snprintf(resp.roomNames[i], sizeof(resp.roomNames[i]), "%s", rooms[i].roomName.c_str());
+        resp.ownerUserIds[i] = rooms[i].ownerUserId;
+        resp.memberCounts[i] = static_cast<uint8_t>(rooms[i].memberUserIds.size());
+        resp.isJoined[i] = rooms[i].memberUserIds.count(userId) > 0 ? 1 : 0;
+        resp.isInvited[i] = rooms[i].invitedUserIds.count(userId) > 0 ? 1 : 0;
+    }
+
+    steamNetworking->SendMessageToConnection(connection, &resp, sizeof(resp), k_nSteamNetworkingSend_ReliableNoNagle, nullptr);
 }

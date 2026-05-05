@@ -13,6 +13,10 @@ RUN apt-get update && apt-get install -y \
     unzip \
     tar \
     pkg-config \
+    autoconf \
+    autoconf-archive \
+    automake \
+    libtool \
     && rm -rf /var/lib/apt/lists/*
 
 # Install vcpkg
@@ -23,7 +27,7 @@ ENV PATH="${VCPKG_ROOT}:${PATH}"
 
 # Install dependencies
 ENV VCPKG_MAX_CONCURRENCY=2
-RUN vcpkg install gamenetworkingsockets:x64-linux ftxui:x64-linux
+RUN vcpkg install gamenetworkingsockets:x64-linux ftxui:x64-linux sqlitecpp:x64-linux libsodium:x64-linux
 
 # Copy source code
 COPY . .
@@ -38,18 +42,22 @@ FROM ubuntu:22.04 AS runtime
 
 WORKDIR /app
 
-# Copy the built binary and required libraries
+# Create persistent data directory
+RUN mkdir -p /app/data
+
+# Copy the built binary
 COPY --from=build /app/VoiceChatServer/build/VoiceChatServer /app/
-COPY --from=build /app/VoiceChatServer/users.db /app/
-COPY --from=build /opt/vcpkg/installed/x64-linux/lib/libGameNetworkingSockets.so /usr/lib/
 
-# Install runtime dependencies
-RUN apt-get update && apt-get install -y \
-    libssl3 \
-    && rm -rf /var/lib/apt/lists/*
+# Copy all vcpkg-built shared libraries (avoids ABI mismatch with apt packages)
+COPY --from=build /opt/vcpkg/installed/x64-linux/lib /usr/lib/
+# Ensure dynamic linker can find the libraries
+ENV LD_LIBRARY_PATH=/usr/lib
 
-# Expose the port the server will listen on
-EXPOSE 27020
+# Only system-level runtime deps not provided by vcpkg
+# libssl3 is already included in ubuntu:22.04 base image
+
+# Expose the port the server will listen on (UDP)
+EXPOSE 27020/udp
 
 # Run the server
 CMD ["./VoiceChatServer"]

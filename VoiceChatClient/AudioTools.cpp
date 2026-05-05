@@ -3,16 +3,17 @@
 //
 
 #include "AudioTools.h"
+#include <algorithm>
+#include <atomic>
+#include <cmath>
 
 #define FRAMES_PER_BUFFER (512)
 #define SAMPLE_RATE   (44100)
 
-//typedef signed short MY_TYPE;
-//#define FORMAT RTAUDIO_SINT16
-
 AudioData data;
 NetworkBuffer* networkBuffer;
 SocketClient* clientSocket;
+static std::atomic<float> g_PeakLevel{0.0f};
 
 int counter = 0;
 
@@ -49,6 +50,8 @@ int record(void* outputBuffer, void* inputBuffer, unsigned int nBufferFrames,
     if (_data == nullptr)
         return 0;
 
+    // Compute peak level for VU meter
+    float peak = 0.0f;
     for (i = 0; i < nBufferFrames; i++)
     {
         //output[2* i] = input[i];     // loop back
@@ -56,7 +59,11 @@ int record(void* outputBuffer, void* inputBuffer, unsigned int nBufferFrames,
 
         // recording
         _data->AddInput(input[i]);
+
+        float sample = std::fabs(static_cast<float>(input[i]) / 32768.0f);
+        if (sample > peak) peak = sample;
     }
+    g_PeakLevel.store(peak, std::memory_order_relaxed);
 
     if (networkBuffer->Size() >= nBufferFrames)
     {
@@ -131,6 +138,10 @@ bool AudioTools::StartRecording(SocketClient* socketClient, NetworkBuffer* buffe
     {
         return false;
     }
+}
+
+float AudioTools::GetPeakLevel() {
+    return g_PeakLevel.exchange(0.0f, std::memory_order_relaxed);
 }
 
 AudioTools::~AudioTools() {
