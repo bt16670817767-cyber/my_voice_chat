@@ -15,6 +15,7 @@ typedef uint16 AUDIO_SAMPLE;
 
 struct AudioData{
     uint8_t type = AUDIO;
+    int32_t senderUserId = -1;
     AUDIO_SAMPLE Input[BufferSize];
     int inputCurrentCounter = -1;
 

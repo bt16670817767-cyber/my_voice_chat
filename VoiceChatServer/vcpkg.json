@@ -1,5 +1,9 @@
 {
   "dependencies": [
-    "gamenetworkingsockets"
+    "uwebsockets",
+    "nlohmann-json",
+    "ftxui",
+    "sqlitecpp",
+    "libsodium"
   ]
 }
