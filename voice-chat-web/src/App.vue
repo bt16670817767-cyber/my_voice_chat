@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch } from 'vue'
+import { ref, watch, computed } from 'vue'
 
 // ==========================================
 // 1. 全局状态
@@ -31,9 +31,23 @@ const allRooms = ref<any[]>([])
 const newRoomName = ref('')
 const newRoomPwd = ref('')
 
+const roomSearchQuery = ref('')
+const showInviteModal = ref(false)
+
 const activeRoom = ref<{id: number, name: string} | null>(null)
 const roomMembers = ref<any[]>([])
 const isMicOn = ref(false)
+
+// 👇 强化版的计算属性：防呆、去空格、防 null
+const filteredRooms = computed(() => {
+  if (!roomSearchQuery.value.trim()) return allRooms.value
+  const lowerQ = roomSearchQuery.value.trim().toLowerCase()
+  return allRooms.value.filter(r => {
+    const rName = r.name ? String(r.name).toLowerCase() : ''
+    const rId = r.id ? String(r.id) : ''
+    return rName.includes(lowerQ) || rId.includes(lowerQ)
+  })
+})
 
 // ==========================================
 // 3. WebRTC P2P 核心逻辑
@@ -131,6 +145,7 @@ const handleConnect = () => {
       if (res.success) {
         activeRoom.value = { id: res.roomId, name: res.roomName }
         roomsSubTab.value = 'lobby'
+        showInviteModal.value = false // 进房时重置面板状态
         startMicrophone()
       } else { alert(res.message) }
     }
@@ -139,7 +154,6 @@ const handleConnect = () => {
         const currentMembers = res.members || []
         roomMembers.value = currentMembers.map((m: any) => ({ ...m, isSpeaking: false }))
 
-        // 修复 TS 严格模式报错：明确告诉 TS 这是一个由 number 组成的 Set
         const currentMemberIds = new Set<number>(currentMembers.map((m: any) => Number(m.id)))
         
         for (const [targetId, pc] of peerConnections.entries()) {
@@ -164,12 +178,17 @@ const handleConnect = () => {
     }
     else if (res.type === 'room_leave_result') {
       if (res.success) {
-        activeRoom.value = null; roomMembers.value = []
+        activeRoom.value = null; roomMembers.value = []; showInviteModal.value = false
         fetchRoomList()
         stopAllWebRTC()
       }
     }
-    
+    else if (res.type === 'room_invite_notify') {
+      if (confirm(`【房间邀请】\n好友 [${res.fromName}] 邀请你加入房间：${res.roomName} (ID:${res.roomId})\n\n是否立即加入？`)) {
+        if (activeRoom.value) leaveRoom()
+        setTimeout(() => joinRoom(res.roomId, res.hasPassword), 300)
+      }
+    }
     // 接收 WebRTC 信令
     else if (res.type === 'webrtc_offer') {
       const pc = getOrCreatePeerConnection(Number(res.fromId))
@@ -230,6 +249,14 @@ const leaveRoom = () => {
   if (activeRoom.value) ws?.send(JSON.stringify({ type: 'room_leave', roomId: activeRoom.value.id }))
 }
 
+const inviteToRoom = (targetId: number) => {
+  if (activeRoom.value) {
+    ws?.send(JSON.stringify({ type: 'room_invite', targetId, roomId: activeRoom.value.id }))
+    alert('✅ 邀请已发送！')
+    showInviteModal.value = false // 邀请后关闭弹窗
+  }
+}
+
 const toggleMic = () => {
   isMicOn.value = !isMicOn.value
   const me = roomMembers.value.find(m => m.id === currentUser.value.id)
@@ -277,6 +304,7 @@ const toggleMic = () => {
       </aside>
 
       <main class="content-area">
+        <!-- 好友模块 -->
         <div v-if="activeTab === 'friends'" class="panel">
           <div class="sub-nav">
             <span :class="{ active: friendsSubTab === 'list' }" @click="friendsSubTab = 'list'">我的好友</span>
@@ -325,6 +353,7 @@ const toggleMic = () => {
           </div>
         </div>
 
+        <!-- 房间模块 -->
         <div v-if="activeTab === 'rooms'" class="panel">
           <div v-if="!activeRoom">
             <div class="sub-nav">
@@ -333,15 +362,24 @@ const toggleMic = () => {
               <button class="btn-primary-small" style="float: right;" @click="fetchRoomList">刷新列表</button>
             </div>
 
-            <div v-if="roomsSubTab === 'lobby'" class="sub-content room-grid">
-              <div v-for="room in allRooms" :key="room.id" class="room-card">
-                <div class="room-header">
-                  <h3>{{ room.name }}</h3>
-                  <span v-if="room.hasPassword" class="lock-icon">🔒</span>
-                </div>
-                <p class="sub-text">ID: {{ room.id }} | 人数: {{ room.count }}</p>
-                <button class="btn-primary" @click="joinRoom(room.id, room.hasPassword)">加入房间</button>
+            <div v-if="roomsSubTab === 'lobby'" class="sub-content">
+              <!-- 👇 加入回车监听和专属的搜索刷新按钮 -->
+              <div class="search-box" style="margin-bottom: 20px;">
+                <input v-model="roomSearchQuery" type="text" placeholder="🔍 搜索房间名称或 ID..." @keyup.enter="fetchRoomList" />
+                <button class="btn-primary" style="width: auto" @click="fetchRoomList">搜索 / 刷新</button>
               </div>
+              
+              <div class="room-grid">
+                <div v-for="room in filteredRooms" :key="room.id" class="room-card">
+                  <div class="room-header">
+                    <h3>{{ room.name }}</h3>
+                    <span v-if="room.hasPassword" class="lock-icon">🔒</span>
+                  </div>
+                  <p class="sub-text">ID: {{ room.id }} | 人数: {{ room.count }}</p>
+                  <button class="btn-primary" @click="joinRoom(room.id, room.hasPassword)">加入房间</button>
+                </div>
+              </div>
+              <p v-if="filteredRooms.length === 0" class="sub-text" style="text-align:center; margin-top: 30px;">没有找到匹配的房间</p>
             </div>
 
             <div v-if="roomsSubTab === 'create'" class="sub-content create-room-form">
@@ -351,10 +389,25 @@ const toggleMic = () => {
             </div>
           </div>
           
-          <div v-else class="active-room-view">
+          <div v-else class="active-room-view" style="position: relative;">
             <div class="room-top-bar">
               <h2>🎙️ {{ activeRoom.name }}</h2>
-              <button class="btn-leave" @click="leaveRoom">退出房间</button>
+              <div>
+                <button class="btn-primary-small" style="margin-right: 15px;" @click="showInviteModal = !showInviteModal">➕ 邀请好友</button>
+                <button class="btn-leave" @click="leaveRoom">退出房间</button>
+              </div>
+            </div>
+
+            <div v-if="showInviteModal" class="invite-panel fade-in">
+              <h3>在线好友</h3>
+              <button class="btn-close" @click="showInviteModal = false">✖</button>
+              <ul class="list">
+                <li v-for="friend in myFriends.filter(f => f.isOnline)" :key="friend.id" class="list-item" style="padding: 10px;">
+                  <span style="font-size: 14px;">{{ friend.displayName }}</span>
+                  <button class="btn-primary-small" style="padding: 5px 10px; font-size: 12px;" @click="inviteToRoom(friend.id)">邀请</button>
+                </li>
+              </ul>
+              <p v-if="myFriends.filter(f => f.isOnline).length === 0" class="sub-text" style="text-align: center;">当前没有在线的好友 😢</p>
             </div>
             
             <div class="members-grid">
@@ -467,4 +520,14 @@ const toggleMic = () => {
 .mic-off:hover { background: #45a049; }
 .mic-on { background: #ff4757; }
 .mic-on:hover { background: #ff3344; }
+
+/* 邀请面板专属 CSS */
+.invite-panel {
+  position: absolute; right: 0; top: 70px; width: 260px;
+  background: #16181d; border: 1px solid #3a3f4b; border-radius: 8px;
+  padding: 15px; box-shadow: 0 10px 30px rgba(0,0,0,0.8); z-index: 100;
+}
+.invite-panel h3 { margin: 0 0 15px 0; font-size: 16px; color: #a1a6b4; }
+.btn-close { position: absolute; right: 10px; top: 15px; background: none; border: none; color: #8b92a5; cursor: pointer; }
+.btn-close:hover { color: #ff4757; }
 </style>

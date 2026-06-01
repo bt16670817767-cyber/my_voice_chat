@@ -53,7 +53,7 @@ private:
     // --- 连接映射与并发控制 ---
     std::map<WebSocket*, SessionInfo> m_sessions;
     std::map<int32_t, WebSocket*> m_userToSocket;
-    std::mutex m_clientsMutex;
+    std::recursive_mutex m_clientsMutex;
 
     // --- 内部辅助函数 ---
     void LogMessage(const std::string& msg);
@@ -83,7 +83,8 @@ private:
     void HandleFriendRemoveRequest(WebSocket* ws, int32_t userId, const json& payload);
     void HandleFriendListRequest(WebSocket* ws, int32_t userId);
     void HandleFriendSentRequests(WebSocket* ws, int32_t userId);
-
+    
+    void HandleRoomInviteRequest(WebSocket* ws, int32_t userId, const json& payload);
     void HandleRoomCreateRequest(WebSocket* ws, int32_t userId, const json& payload);
     void HandleRoomJoinRequest(WebSocket* ws, int32_t userId, const json& payload);
     void HandleRoomLeaveRequest(WebSocket* ws, int32_t userId, const json& payload);

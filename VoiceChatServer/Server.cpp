@@ -62,7 +62,7 @@ void Server::SendJson(WebSocket* ws, const json& payload) {
 }
 
 void Server::SendMessageToUser(int32_t userId, const json& payload) {
-    std::lock_guard<std::mutex> lock(m_clientsMutex);
+    std::lock_guard<std::recursive_mutex> lock(m_clientsMutex);
     auto it = m_userToSocket.find(userId);
     if (it != m_userToSocket.end()) {
         SendJson(it->second, payload);
@@ -73,7 +73,7 @@ void Server::BroadcastToRoom(int32_t roomId, const json& payload, int32_t exclud
     auto* room = m_roomManager.GetRoom(roomId);
     if (!room) return;
 
-    std::lock_guard<std::mutex> lock(m_clientsMutex);
+    std::lock_guard<std::recursive_mutex> lock(m_clientsMutex);
     for (int32_t memberId : room->memberUserIds) {
         if (memberId == excludeUserId) continue;
         auto it = m_userToSocket.find(memberId);
@@ -84,7 +84,7 @@ void Server::BroadcastToRoom(int32_t roomId, const json& payload, int32_t exclud
 }
 
 void Server::OnConnection(WebSocket* ws) {
-    std::lock_guard<std::mutex> lock(m_clientsMutex);
+    std::lock_guard<std::recursive_mutex> lock(m_clientsMutex);
     m_sessions[ws] = SessionInfo{}; 
     LogMessage("New client connected.");
 }
@@ -128,7 +128,7 @@ void Server::HandleUserDisconnect(WebSocket* ws) {
 }
 
 void Server::OnDisconnection(WebSocket* ws, int code, std::string_view message) {
-    std::lock_guard<std::mutex> lock(m_clientsMutex);
+    std::lock_guard<std::recursive_mutex> lock(m_clientsMutex);
     HandleUserDisconnect(ws);
     m_sessions.erase(ws);
 }
@@ -165,7 +165,7 @@ void Server::OnMessage(WebSocket* ws, std::string_view message, uWS::OpCode opCo
 
         int32_t userId = -1;
         {
-            std::lock_guard<std::mutex> lock(m_clientsMutex);
+            std::lock_guard<std::recursive_mutex> lock(m_clientsMutex);
             auto it = m_sessions.find(ws);
             if (it == m_sessions.end() || !it->second.authenticated) {
                 SendJson(ws, {{"type", "error"}, {"message", "Unauthorized. Please login first."}});
@@ -185,6 +185,7 @@ void Server::OnMessage(WebSocket* ws, std::string_view message, uWS::OpCode opCo
         else if (type == "room_join") HandleRoomJoinRequest(ws, userId, payload);
         else if (type == "room_leave") HandleRoomLeaveRequest(ws, userId, payload);
         else if (type == "room_list") HandleRoomListRequest(ws, userId);
+        else if (type == "room_invite") HandleRoomInviteRequest(ws, userId, payload);
         else if (type == "logout") {
             HandleLogoutRequest(ws, userId);
         }
@@ -275,7 +276,7 @@ void Server::HandleLoginRequest(WebSocket* ws, const json& payload) {
 
     // 4. 登录成功！登记 Session 会话状态
     {
-        std::lock_guard<std::mutex> lock(m_clientsMutex);
+        std::lock_guard<std::recursive_mutex> lock(m_clientsMutex);
         
         // 检查该用户是否已经在别处登录？如果是，我们可以选择踢掉旧连接（这里为了简单先允许覆盖映射）
         m_sessions[ws].userId = userOpt->id;
@@ -321,7 +322,7 @@ void Server::HandleFriendListRequest(WebSocket* ws, int32_t userId) {
     for (const auto& f : friends) {
         bool isOnline = false;
         {
-            std::lock_guard<std::mutex> lock(m_clientsMutex);
+            std::lock_guard<std::recursive_mutex> lock(m_clientsMutex);
             isOnline = (m_userToSocket.find(f.userId) != m_userToSocket.end());
         }
         response["friends"].push_back({
@@ -358,7 +359,7 @@ void Server::HandleFriendSearchRequest(WebSocket* ws, int32_t userId, const json
     for (const auto& r : results) {
         bool isOnline = false;
         {
-            std::lock_guard<std::mutex> lock(m_clientsMutex);
+            std::lock_guard<std::recursive_mutex> lock(m_clientsMutex);
             isOnline = (m_userToSocket.find(r.userId) != m_userToSocket.end());
         }
         response["results"].push_back({
@@ -388,7 +389,7 @@ void Server::HandleFriendAddRequest(WebSocket* ws, int32_t userId, const json& p
     if (success) {
         std::string myName;
         {
-            std::lock_guard<std::mutex> lock(m_clientsMutex);
+            std::lock_guard<std::recursive_mutex> lock(m_clientsMutex);
             myName = m_sessions[ws].displayName;
         }
         SendMessageToUser(targetId, {
@@ -481,7 +482,7 @@ void Server::HandleRoomCreateRequest(WebSocket* ws, int32_t userId, const json& 
     
     // 2. 登记 Session
     {
-        std::lock_guard<std::mutex> lock(m_clientsMutex);
+        std::lock_guard<std::recursive_mutex> lock(m_clientsMutex);
         m_sessions[ws].activeRoomIds.insert(roomId);
     }
 
@@ -496,7 +497,7 @@ void Server::HandleRoomCreateRequest(WebSocket* ws, int32_t userId, const json& 
     // 创建者默认是唯一成员，发送一下成员列表让前端刷新
     std::string myName;
     {
-        std::lock_guard<std::mutex> lock(m_clientsMutex);
+        std::lock_guard<std::recursive_mutex> lock(m_clientsMutex);
         myName = m_sessions[ws].displayName;
     }
     SendJson(ws, {
@@ -524,7 +525,7 @@ void Server::HandleRoomJoinRequest(WebSocket* ws, int32_t userId, const json& pa
     // 1. 加入房间
     m_roomManager.AddMember(roomId, userId);
     {
-        std::lock_guard<std::mutex> lock(m_clientsMutex);
+        std::lock_guard<std::recursive_mutex> lock(m_clientsMutex);
         m_sessions[ws].activeRoomIds.insert(roomId);
     }
 
@@ -545,7 +546,7 @@ void Server::HandleRoomJoinRequest(WebSocket* ws, int32_t userId, const json& pa
     
     const RoomInfo* updatedRoom = m_roomManager.GetRoom(roomId);
     if (updatedRoom) {
-        std::lock_guard<std::mutex> lock(m_clientsMutex);
+        std::lock_guard<std::recursive_mutex> lock(m_clientsMutex);
         for (int32_t mId : updatedRoom->memberUserIds) {
             auto m_it = m_userToSocket.find(mId);
             if (m_it != m_userToSocket.end()) {
@@ -564,7 +565,7 @@ void Server::HandleRoomLeaveRequest(WebSocket* ws, int32_t userId, const json& p
     
     m_roomManager.RemoveMember(roomId, userId);
     {
-        std::lock_guard<std::mutex> lock(m_clientsMutex);
+        std::lock_guard<std::recursive_mutex> lock(m_clientsMutex);
         m_sessions[ws].activeRoomIds.erase(roomId);
     }
 
@@ -584,7 +585,7 @@ void Server::HandleRoomLeaveRequest(WebSocket* ws, int32_t userId, const json& p
                 {"roomId", roomId},
                 {"members", json::array()}
             };
-            std::lock_guard<std::mutex> lock(m_clientsMutex);
+            std::lock_guard<std::recursive_mutex> lock(m_clientsMutex);
             for (int32_t mId : room->memberUserIds) {
                 auto m_it = m_userToSocket.find(mId);
                 if (m_it != m_userToSocket.end()) {
@@ -611,7 +612,7 @@ void Server::HandleLogoutRequest(WebSocket* ws, int32_t userId) {
     
     // 2. 清空该 WebSocket 的 Session 认证状态，但保持 TCP 连接不断开
     {
-        std::lock_guard<std::mutex> lock(m_clientsMutex);
+        std::lock_guard<std::recursive_mutex> lock(m_clientsMutex);
         m_sessions[ws] = SessionInfo{}; 
     }
     
@@ -633,4 +634,33 @@ void Server::HandleWebRTCSignaling(WebSocket* ws, int32_t userId, const json& pa
     forwarded["fromId"] = userId;
     
     SendMessageToUser(targetId, forwarded);
+}
+// ==========================================
+// 附加功能：邀请好友加入房间
+// ==========================================
+void Server::HandleRoomInviteRequest(WebSocket* ws, int32_t userId, const json& payload) {
+    int32_t targetId = payload.value("targetId", -1);
+    int32_t roomId = payload.value("roomId", -1);
+
+    const RoomInfo* room = m_roomManager.GetRoom(roomId);
+    if (!room) return;
+
+    // 检查发送邀请的人是不是真的在这个房间里（防作弊）
+    if (room->memberUserIds.count(userId) == 0) return;
+
+    std::string myName;
+    {
+        std::lock_guard<std::recursive_mutex> lock(m_clientsMutex);
+        myName = m_sessions[ws].displayName;
+    }
+
+    // 将邀请直接推送给目标好友
+    SendMessageToUser(targetId, {
+        {"type", "room_invite_notify"},
+        {"roomId", roomId},
+        {"roomName", room->roomName},
+        {"fromId", userId},
+        {"fromName", myName},
+        {"hasPassword", !room->password.empty()}
+    });
 }
