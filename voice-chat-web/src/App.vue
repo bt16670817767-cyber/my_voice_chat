@@ -2,6 +2,47 @@
 import { ref, watch, computed } from 'vue'
 
 // ==========================================
+// 0. 全局 UI 弹窗系统 (替代原生 alert/confirm/prompt)
+// ==========================================
+const customModal = ref<{
+  isOpen: boolean;
+  type: 'alert' | 'confirm' | 'prompt';
+  title: string;
+  message: string;
+  inputValue: string;
+  isPassword?: boolean;
+  onConfirm?: Function; 
+  onCancel?: Function;
+}>({
+  isOpen: false, type: 'alert', title: '', message: '', inputValue: ''
+})
+
+const showAlert = (message: string, title = '提示') => {
+  customModal.value = { isOpen: true, type: 'alert', title, message, inputValue: '' }
+}
+
+const showConfirm = (message: string, onConfirm: () => void, title = '请确认') => {
+  customModal.value = { isOpen: true, type: 'confirm', title, message, onConfirm, inputValue: '' }
+}
+
+const showPrompt = (message: string, onConfirm: (val: string) => void, isPassword = false, title = '请输入') => {
+  customModal.value = { isOpen: true, type: 'prompt', title, message, onConfirm, isPassword, inputValue: '' }
+}
+
+const closeModal = () => {
+  if (customModal.value.onCancel) customModal.value.onCancel()
+  customModal.value.isOpen = false
+}
+
+const confirmModal = () => {
+  if (customModal.value.onConfirm) {
+    if (customModal.value.type === 'prompt') customModal.value.onConfirm(customModal.value.inputValue)
+    else customModal.value.onConfirm()
+  }
+  customModal.value.isOpen = false
+}
+
+// ==========================================
 // 1. 全局状态
 // ==========================================
 const currentScreen = ref('connect') 
@@ -38,7 +79,6 @@ const activeRoom = ref<{id: number, name: string} | null>(null)
 const roomMembers = ref<any[]>([])
 const isMicOn = ref(false)
 
-// 👇 强化版的计算属性：防呆、去空格、防 null
 const filteredRooms = computed(() => {
   if (!roomSearchQuery.value.trim()) return allRooms.value
   const lowerQ = roomSearchQuery.value.trim().toLowerCase()
@@ -56,14 +96,17 @@ const peerConnections = new Map<number, RTCPeerConnection>()
 let localStream: MediaStream | null = null
 const rtcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] }
 
+// 🚀 核心修复 1：变为防抖异步函数
 const startMicrophone = async () => {
+  if (localStream) return // 如果已经获取过麦克风，直接跳过，防止重复获取
+
   try {
     localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false })
     localStream.getAudioTracks()[0].enabled = false // 默认进房闭麦
     isMicOn.value = false
   } catch (err) {
     console.error("获取麦克风失败:", err)
-    alert("无法访问麦克风，请允许网页使用麦克风！")
+    showAlert("无法访问麦克风，您将只能听见别人的声音！", "麦克风权限")
   }
 }
 
@@ -82,13 +125,20 @@ const getOrCreatePeerConnection = (targetId: number) => {
   const pc = new RTCPeerConnection(rtcConfig)
   peerConnections.set(targetId, pc)
 
+  // 因为我们保证了进房前 localStream 已经准备好，所以这里百分百能加上轨道
   if (localStream) {
     localStream.getTracks().forEach(track => pc.addTrack(track, localStream!))
   }
 
   pc.ontrack = (event) => {
-    const audioEl = document.getElementById('audio-' + targetId) as HTMLAudioElement
-    if (audioEl) audioEl.srcObject = event.streams[0]
+    // 延迟一点点，确保 Vue 已经把 audio 标签渲染出来了
+    setTimeout(() => {
+      const audioEl = document.getElementById('audio-' + targetId) as HTMLAudioElement
+      if (audioEl) {
+        audioEl.srcObject = event.streams[0]
+        audioEl.play().catch(e => console.warn("浏览器自动播放限制", e))
+      }
+    }, 100)
   }
 
   pc.onicecandidate = (event) => {
@@ -103,20 +153,20 @@ const getOrCreatePeerConnection = (targetId: number) => {
 // 4. WebSocket 核心通信逻辑
 // ==========================================
 const handleLogout = () => {
-  if (confirm('确定要退出登录吗？')) {
+  showConfirm('确定要退出登录吗？', () => {
     ws?.send(JSON.stringify({ type: 'logout' }))
     stopAllWebRTC()
     currentScreen.value = 'auth'
     currentUser.value = { id: 0, username: '', displayName: '' }
     activeRoom.value = null; myFriends.value = []; allRooms.value = []; roomMembers.value = []
-  }
+  }, "退出登录")
 }
 
 const handleConnect = () => {
   ws = new WebSocket(`ws://${serverIp.value}:${serverPort.value}`)
   ws.onopen = () => { currentScreen.value = 'auth' }
   ws.onclose = () => {
-    alert('与服务器断开连接')
+    showAlert('与服务器断开连接', '网络错误')
     stopAllWebRTC()
     currentScreen.value = 'connect'
   }
@@ -130,13 +180,13 @@ const handleConnect = () => {
         currentScreen.value = 'main'
         fetchFriendList()
         fetchRoomList()
-      } else { alert(res.message) }
+      } else { showAlert(res.message, '认证失败') }
     }
     else if (res.type === 'friend_list_result') {
       myFriends.value = res.friends || []; pendingRequests.value = res.pending || []
     }
     else if (res.type === 'friend_search_result') { searchResults.value = res.results || [] }
-    else if (res.type === 'friend_add_result') { if (res.success) alert('好友请求发送成功！') }
+    else if (res.type === 'friend_add_result') { if (res.success) showAlert('好友请求发送成功！', '成功') }
     else if (['friend_request_notify', 'friend_accept_notify', 'friend_remove_notify', 'friend_online_notify'].includes(res.type)) {
       fetchFriendList() 
     }
@@ -145,9 +195,9 @@ const handleConnect = () => {
       if (res.success) {
         activeRoom.value = { id: res.roomId, name: res.roomName }
         roomsSubTab.value = 'lobby'
-        showInviteModal.value = false // 进房时重置面板状态
-        startMicrophone()
-      } else { alert(res.message) }
+        showInviteModal.value = false 
+        // 🚀 核心修复 2：去掉了这里的 startMicrophone()，因为已经在发请求前拿过了
+      } else { showAlert(res.message, '房间提示') }
     }
     else if (res.type === 'room_member_update') {
       if (activeRoom.value && activeRoom.value.id === res.roomId) {
@@ -180,15 +230,16 @@ const handleConnect = () => {
       if (res.success) {
         activeRoom.value = null; roomMembers.value = []; showInviteModal.value = false
         fetchRoomList()
-        stopAllWebRTC()
+        stopAllWebRTC() // 退房时销毁流，下次进房会重新请求
       }
     }
     else if (res.type === 'room_invite_notify') {
-      if (confirm(`【房间邀请】\n好友 [${res.fromName}] 邀请你加入房间：${res.roomName} (ID:${res.roomId})\n\n是否立即加入？`)) {
+      showConfirm(`【房间邀请】\n好友 [${res.fromName}] 邀请你加入房间：${res.roomName} (ID:${res.roomId})\n\n是否立即加入？`, () => {
         if (activeRoom.value) leaveRoom()
         setTimeout(() => joinRoom(res.roomId, res.hasPassword), 300)
-      }
+      }, "收到邀请")
     }
+    
     // 接收 WebRTC 信令
     else if (res.type === 'webrtc_offer') {
       const pc = getOrCreatePeerConnection(Number(res.fromId))
@@ -226,25 +277,37 @@ const sendFriendRequest = (targetId: number) => ws?.send(JSON.stringify({ type: 
 const acceptFriend = (targetId: number) => ws?.send(JSON.stringify({ type: 'friend_accept', targetId }))
 const rejectFriend = (targetId: number) => ws?.send(JSON.stringify({ type: 'friend_reject', targetId }))
 const removeFriend = (targetId: number) => {
-  if(confirm('确定删除此好友？')) ws?.send(JSON.stringify({ type: 'friend_remove', targetId }))
+  showConfirm('确定删除此好友？', () => {
+    ws?.send(JSON.stringify({ type: 'friend_remove', targetId }))
+  }, "删除好友")
 }
 const fetchRoomList = () => ws?.send(JSON.stringify({ type: 'room_list' }))
 
 watch(activeTab, (val) => { if (val === 'rooms' && !activeRoom.value) fetchRoomList() })
 watch(roomsSubTab, (val) => { if (val === 'lobby' && !activeRoom.value) fetchRoomList() })
 
-const createRoom = () => {
-  if (!newRoomName.value) return alert('请输入房间名')
+// 🚀 核心修复 3：创建和加入房间变为 async 函数，先阻塞等待麦克风
+const createRoom = async () => {
+  if (!newRoomName.value) return showAlert('请输入房间名', '提示')
+  
+  await startMicrophone() // 先等待麦克风准备好
+  
   ws?.send(JSON.stringify({ type: 'room_create', roomName: newRoomName.value, password: newRoomPwd.value }))
   newRoomName.value = ''; newRoomPwd.value = ''
 }
-const joinRoom = (roomId: number, hasPwd = false) => {
-  let pwd = ''
+
+const joinRoom = async (roomId: number, hasPwd = false) => {
   if (hasPwd) {
-    const input = prompt('该房间需要密码：'); if (input === null) return; pwd = input
+    showPrompt('该房间需要密码：', async (input) => {
+      await startMicrophone() // 先等待麦克风准备好
+      ws?.send(JSON.stringify({ type: 'room_join', roomId, password: input }))
+    }, true, '输入密码')
+  } else {
+    await startMicrophone() // 先等待麦克风准备好
+    ws?.send(JSON.stringify({ type: 'room_join', roomId, password: '' }))
   }
-  ws?.send(JSON.stringify({ type: 'room_join', roomId, password: pwd }))
 }
+
 const leaveRoom = () => {
   if (activeRoom.value) ws?.send(JSON.stringify({ type: 'room_leave', roomId: activeRoom.value.id }))
 }
@@ -252,8 +315,8 @@ const leaveRoom = () => {
 const inviteToRoom = (targetId: number) => {
   if (activeRoom.value) {
     ws?.send(JSON.stringify({ type: 'room_invite', targetId, roomId: activeRoom.value.id }))
-    alert('✅ 邀请已发送！')
-    showInviteModal.value = false // 邀请后关闭弹窗
+    showAlert('✅ 邀请已发送！', '成功')
+    showInviteModal.value = false 
   }
 }
 
@@ -270,6 +333,29 @@ const toggleMic = () => {
 
 <template>
   <div class="app-container">
+    
+    <div v-if="customModal.isOpen" class="modal-overlay fade-in">
+      <div class="modal-card" style="width: 380px;">
+        <h3 style="margin-top:0; color:#61dafb; margin-bottom: 20px; font-size: 18px;">{{ customModal.title }}</h3>
+        <p style="white-space: pre-wrap; line-height: 1.5; color: #e2e8f0; margin-bottom: 25px; font-size: 15px;">{{ customModal.message }}</p>
+        
+        <div v-if="customModal.type === 'prompt'" class="input-group">
+          <input 
+            v-model="customModal.inputValue" 
+            :type="customModal.isPassword ? 'password' : 'text'" 
+            placeholder="请输入..."
+            @keyup.enter="confirmModal"
+            autofocus
+          />
+        </div>
+
+        <div class="modal-actions">
+          <button v-if="customModal.type !== 'alert'" class="btn-cancel" @click="closeModal">取消</button>
+          <button class="btn-primary" style="width: auto; padding: 10px 24px;" @click="confirmModal">确定</button>
+        </div>
+      </div>
+    </div>
+
     <div v-if="currentScreen === 'connect'" class="modal-card fade-in">
       <h2>🌐 连接至服务器</h2>
       <div class="input-group"><label>IP</label><input v-model="serverIp" type="text" /></div>
@@ -304,7 +390,6 @@ const toggleMic = () => {
       </aside>
 
       <main class="content-area">
-        <!-- 好友模块 -->
         <div v-if="activeTab === 'friends'" class="panel">
           <div class="sub-nav">
             <span :class="{ active: friendsSubTab === 'list' }" @click="friendsSubTab = 'list'">我的好友</span>
@@ -353,7 +438,6 @@ const toggleMic = () => {
           </div>
         </div>
 
-        <!-- 房间模块 -->
         <div v-if="activeTab === 'rooms'" class="panel">
           <div v-if="!activeRoom">
             <div class="sub-nav">
@@ -363,7 +447,6 @@ const toggleMic = () => {
             </div>
 
             <div v-if="roomsSubTab === 'lobby'" class="sub-content">
-              <!-- 👇 加入回车监听和专属的搜索刷新按钮 -->
               <div class="search-box" style="margin-bottom: 20px;">
                 <input v-model="roomSearchQuery" type="text" placeholder="🔍 搜索房间名称或 ID..." @keyup.enter="fetchRoomList" />
                 <button class="btn-primary" style="width: auto" @click="fetchRoomList">搜索 / 刷新</button>
@@ -530,4 +613,19 @@ const toggleMic = () => {
 .invite-panel h3 { margin: 0 0 15px 0; font-size: 16px; color: #a1a6b4; }
 .btn-close { position: absolute; right: 10px; top: 15px; background: none; border: none; color: #8b92a5; cursor: pointer; }
 .btn-close:hover { color: #ff4757; }
+
+/* 全局遮罩弹窗 CSS */
+.modal-overlay {
+  position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
+  background: rgba(0,0,0,0.75); display: flex; justify-content: center; align-items: center;
+  z-index: 9999; backdrop-filter: blur(4px);
+}
+.modal-actions {
+  display: flex; justify-content: flex-end; gap: 15px; margin-top: 10px;
+}
+.btn-cancel {
+  padding: 10px 24px; background: transparent; border: 1px solid #3a3f4b; 
+  color: #a1a6b4; border-radius: 6px; cursor: pointer; transition: 0.2s; font-size: 15px;
+}
+.btn-cancel:hover { background: #2d313a; color: white; border-color: #61dafb; }
 </style>
